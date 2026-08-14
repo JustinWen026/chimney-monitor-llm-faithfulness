@@ -2,82 +2,72 @@ from datetime import datetime
 import os
 import time
 import cv2
+from db_manager import log_incident
+from discord_notifier import send_discord_alert_async
 from ultralytics import YOLO
 
-# 匯入獨立拆分的 Discord 告警模組[cite: 8]
-from discord_notifier import send_discord_alert_async  #[cite: 8]
-
 # ==============================================================================
-# 1. 系統參數配置[cite: 8]
+# 1. 系統參數配置
 # ==============================================================================
 PROJECT_ROOT = r"D:\NCKU_paper_Capstone_Project"
-VIDEO_PATH = r"D:\NCKU_paper_Capstone_Project\PixVerse_Clean_Slow.mp4"
+VIDEO_PATH = os.path.join(PROJECT_ROOT, "PixVerse_Clean_Slow.mp4")
 MODEL_PATH = os.path.join(
     PROJECT_ROOT, r"runs\detect\chimney_smoke_fire_yolo11s\weights\best.pt"
 )
+SNAPSHOT_DIR = os.path.join(PROJECT_ROOT, "snapshots")
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
-ALERT_THRESHOLD_SEC = 3.0  # 狀態機安全閾值 (秒)[cite: 8]
-ALERT_COOLDOWN_SEC = 60.0  # 告警防連發冷卻時間 (秒)[cite: 8]
+ALERT_THRESHOLD_SEC = 3.0  # 狀態機安全閾值 (秒)
+ALERT_COOLDOWN_SEC = 60.0  # 告警防連發冷卻時間 (秒)
 
 
 def main():
   print(
       f"[{datetime.now().strftime('%H:%M:%S')}] [INIT] 正在初始化 YOLOv11"
-      " 推論引擎..."
-  )  #[cite: 8]
-  model = YOLO(MODEL_PATH)  #[cite: 8]
-  cap = cv2.VideoCapture(VIDEO_PATH)  #[cite: 8]
+      " 推論引擎 (V2 存證與工安資料庫版)..."
+  )
+  model = YOLO(MODEL_PATH)
+  cap = cv2.VideoCapture(VIDEO_PATH)
 
-  if not cap.isOpened():  #[cite: 8]
+  if not cap.isOpened():
     print(f"❌ 錯誤：無法開啟影片，請確認路徑：{VIDEO_PATH}")
     return
 
-  # 狀態機與告警時序核心變數[cite: 8]
-  current_state = "NORMAL"  #[cite: 8]
+  current_state = "NORMAL"
   anomaly_start_time = None
   active_anomaly_type = None
-  duration = 0.0  #[cite: 8]
-  last_alert_time = 0.0  # 記錄上一次成功觸發 Discord 告警的時間戳[cite: 8]
+  duration = 0.0
+  last_alert_time = 0.0
 
-  # FPS 平滑緩衝[cite: 8]
-  frame_counter = 0  #[cite: 8]
-  display_pipe_fps = 0.0  #[cite: 8]
+  frame_counter = 0
+  display_pipe_fps = 0.0
 
-  print("\n" + "=" * 95)  #[cite: 8]
-  print(" 🚀 工業煙囪 AI 影像安全監控系統已啟動...")
-  print(
-      " 說明：結合 YOLOv11 視覺辨識、時序狀態機演算法與 Discord 即時主動通報。"
-  )
-  print("=" * 95 + "\n")  #[cite: 8]
+  video_fps = cap.get(cv2.CAP_PROP_FPS)
+  wait_ms = int(1000 / video_fps) if video_fps > 0 else 30
 
-  video_fps = cap.get(cv2.CAP_PROP_FPS)  #[cite: 8]
-  wait_ms = int(1000 / video_fps) if video_fps > 0 else 30  #[cite: 8]
+  while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+      break
 
-  while cap.isOpened():  #[cite: 8]
-    ret, frame = cap.read()  #[cite: 8]
-    if not ret:  #[cite: 8]
-      break  #[cite: 8]
+    # GPU 推論
+    results = model(frame, device=0, verbose=False)
+    annotated_frame = results[0].plot()
 
-    # GPU 推論 (RTX 5060 加速)[cite: 8]
-    results = model(frame, device=0, verbose=False)  #[cite: 8]
-    annotated_frame = results[0].plot()  #[cite: 8]
+    t_pre = results[0].speed.get("preprocess", 0.0)
+    t_inf = results[0].speed.get("inference", 0.0)
+    t_post = results[0].speed.get("postprocess", 0.0)
+    total_latency = t_pre + t_inf + t_post
 
-    # FPS 計算[cite: 8]
-    t_pre = results[0].speed.get("preprocess", 0.0)  #[cite: 8]
-    t_inf = results[0].speed.get("inference", 0.0)  #[cite: 8]
-    t_post = results[0].speed.get("postprocess", 0.0)  #[cite: 8]
-    total_latency = t_pre + t_inf + t_post  #[cite: 8]
-
-    frame_counter += 1  #[cite: 8]
-    if frame_counter % 10 == 0 or frame_counter == 1:  #[cite: 8]
+    frame_counter += 1
+    if frame_counter % 10 == 0 or frame_counter == 1:
       display_pipe_fps = (
           1000.0 / total_latency if total_latency > 0 else 0.0
-      )  #[cite: 8]
+      )
 
-    # 解析標籤：納入 black_smoky, white_smoky 以及 fire
     detected_classes = [
         model.names[int(box.cls[0])] for box in results[0].boxes
-    ]  #[cite: 8]
+    ]
     target_anomalies = ["fire", "black_smoky", "white_smoky"]
 
     has_anomaly = any(cls in target_anomalies for cls in detected_classes)
@@ -85,30 +75,26 @@ def main():
         (cls for cls in detected_classes if cls in target_anomalies), None
     )
 
-    current_time = time.time()  #[cite: 8]
+    current_time = time.time()
 
     # ==============================================================================
-    # ⚙️ 時序狀態機演算法內核與運算 (含防連發機制)[cite: 8]
+    # ⚙️ 時序狀態機與存證紀錄
     # ==============================================================================
-    if current_state == "NORMAL":  #[cite: 8]
-      duration = 0.0  #[cite: 8]
+    if current_state == "NORMAL":
+      duration = 0.0
       if has_anomaly:
-        current_state = "ACCUMULATING"  #[cite: 8]
+        current_state = "ACCUMULATING"
         anomaly_start_time = current_time
         active_anomaly_type = current_frame_anomaly
-        print(
-            f"\n[{datetime.now().strftime('%H:%M:%S')}] 🚨 狀態機跳轉: NORMAL ➔"
-            f" ACCUMULATING (偵測到: {active_anomaly_type})"
-        )
       else:
         print(
             "\r[STATE: NORMAL] 🟢 煙囪無異常，狀態機守衛中... | 效能:"
             f" {display_pipe_fps:.1f} FPS   ",
             end="",
             flush=True,
-        )  #[cite: 8]
+        )
 
-    elif current_state == "ACCUMULATING":  #[cite: 8]
+    elif current_state == "ACCUMULATING":
       if has_anomaly:
         duration = current_time - anomaly_start_time
         print(
@@ -116,41 +102,51 @@ def main():
             f" {duration:.2f}s / {ALERT_THRESHOLD_SEC}s... ",
             end="",
             flush=True,
-        )  #[cite: 8]
+        )
 
-        if duration >= ALERT_THRESHOLD_SEC:  #[cite: 8]
-          # 關鍵瞬間：時序滿 3 秒，突破臨界點！[cite: 8]
-          current_state = "TRIGGERED"  #[cite: 8]
+        if duration >= ALERT_THRESHOLD_SEC:
+          current_state = "TRIGGERED"
           print(
-              f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔥"
-              " 異常達到滿載臨界值！狀態跳轉: TRIGGERED"
-          )  #[cite: 8]
+              f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔥 達到滿載臨界值！狀態跳轉:"
+              " TRIGGERED"
+          )
 
-          # 安全通報防連發邏輯[cite: 8]
-          if (current_time - last_alert_time) > ALERT_COOLDOWN_SEC:  #[cite: 8]
-            readable_time = datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )  #[cite: 8]
+          # 📸 功能 3：自動截圖存證
+          timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+          snapshot_name = f"snapshot_{timestamp_str}_{active_anomaly_type}.jpg"
+          snapshot_full_path = os.path.join(SNAPSHOT_DIR, snapshot_name)
+          cv2.imwrite(snapshot_full_path, annotated_frame)
+          print(f"📸 [存證存檔] 現場影像已保存至: {snapshot_full_path}")
+
+          # 💾 功能 1：寫入 SQLite 工安資料庫
+          incident_id = log_incident(
+              event_type=active_anomaly_type,
+              duration=round(duration, 1),
+              snapshot_path=snapshot_full_path,
+          )
+          print(
+              f"💾 [SQL資料庫] 已新增工安紀錄 (ID: #{incident_id},"
+              f" 狀態: PENDING)"
+          )
+
+          # 🚨 Discord 即時非同步發送
+          if (current_time - last_alert_time) > ALERT_COOLDOWN_SEC:
+            readable_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             send_discord_alert_async(
                 timestamp=readable_time,
                 duration=round(duration, 1),
                 event_type=active_anomaly_type or "smoke",
-            )  #[cite: 8]
-            last_alert_time = current_time  #[cite: 8]
-          else:
-            print(
-                f"[{datetime.now().strftime('%H:%M:%S')}] 🛡️  [防連發保護]"
-                " 處於冷卻期內，跳過本次 Discord 卡片發送。"
-            )  #[cite: 8]
+            )
+            last_alert_time = current_time
       else:
         print(
             f"\n[{datetime.now().strftime('%H:%M:%S')}] 🟢 異常中斷，狀態機重置回"
             " NORMAL"
-        )  #[cite: 8]
-        current_state = "NORMAL"  #[cite: 8]
+        )
+        current_state = "NORMAL"
         anomaly_start_time = None
 
-    elif current_state == "TRIGGERED":  #[cite: 8]
+    elif current_state == "TRIGGERED":
       if has_anomaly:
         duration = current_time - anomaly_start_time
         print(
@@ -158,50 +154,47 @@ def main():
             f" {duration:.2f}s   ",
             end="",
             flush=True,
-        )  #[cite: 8]
+        )
       else:
         print(
             f"\n[{datetime.now().strftime('%H:%M:%S')}] 🟢 工安危機解除，狀態機重置"
-        )  #[cite: 8]
-        current_state = "NORMAL"  #[cite: 8]
+        )
+        current_state = "NORMAL"
         anomaly_start_time = None
 
     # ==============================================================================
-    # 🎨 狀態機演算法視覺化 (UI 疊加)[cite: 8]
+    # 🎨 狀態機 UI 視覺化
     # ==============================================================================
-    bar_x, bar_y = 10, 40  #[cite: 8]
-    bar_width, bar_height = 120, 8  #[cite: 8]
+    bar_x, bar_y = 10, 40
+    bar_width, bar_height = 120, 8
 
-    if current_state == "NORMAL":  #[cite: 8]
-      status_color = (0, 255, 0)  # 綠色[cite: 8]
-      progress_ratio = 0.0  #[cite: 8]
-    elif current_state == "ACCUMULATING":  #[cite: 8]
-      status_color = (0, 165, 255)  # 橘黃色[cite: 8]
-      progress_ratio = min(duration / ALERT_THRESHOLD_SEC, 1.0)  #[cite: 8]
-    else:  # TRIGGERED[cite: 8]
-      status_color = (0, 0, 255)  # 鮮紅色[cite: 8]
-      progress_ratio = 1.0  #[cite: 8]
+    if current_state == "NORMAL":
+      status_color = (0, 255, 0)
+      progress_ratio = 0.0
+    elif current_state == "ACCUMULATING":
+      status_color = (0, 165, 255)
+      progress_ratio = min(duration / ALERT_THRESHOLD_SEC, 1.0)
+    else:
+      status_color = (0, 0, 255)
+      progress_ratio = 1.0
 
-    # 1. 繪製進度條外框[cite: 8]
     cv2.rectangle(
         annotated_frame,
         (bar_x, bar_y),
         (bar_x + bar_width, bar_y + bar_height),
         (255, 255, 255),
         1,
-    )  #[cite: 8]
-    # 2. 動態填滿進度條[cite: 8]
-    fill_width = int(bar_width * progress_ratio)  #[cite: 8]
-    if fill_width > 0:  #[cite: 8]
+    )
+    fill_width = int(bar_width * progress_ratio)
+    if fill_width > 0:
       cv2.rectangle(
           annotated_frame,
           (bar_x, bar_y),
           (bar_x + fill_width, bar_y + bar_height),
           status_color,
           -1,
-      )  #[cite: 8]
+      )
 
-    # 3. 疊加文字資訊[cite: 8]
     cv2.putText(
         annotated_frame,
         f"STATE: {current_state}",
@@ -211,7 +204,7 @@ def main():
         status_color,
         2,
         cv2.LINE_AA,
-    )  #[cite: 8]
+    )
     cv2.putText(
         annotated_frame,
         f"Time: {duration:.1f}s / {ALERT_THRESHOLD_SEC}s",
@@ -221,7 +214,7 @@ def main():
         (200, 200, 200),
         1,
         cv2.LINE_AA,
-    )  #[cite: 8]
+    )
     cv2.putText(
         annotated_frame,
         f"FPS: {display_pipe_fps:.1f}",
@@ -231,10 +224,9 @@ def main():
         (255, 255, 255),
         1,
         cv2.LINE_AA,
-    )  #[cite: 8]
+    )
 
-    # 4. 警報狀態提示[cite: 8]
-    if current_state == "TRIGGERED":  #[cite: 8]
+    if current_state == "TRIGGERED":
       cv2.putText(
           annotated_frame,
           "[CRITICAL ALERT]",
@@ -244,19 +236,15 @@ def main():
           (0, 0, 255),
           2,
           cv2.LINE_AA,
-      )  #[cite: 8]
+      )
 
-    cv2.imshow(
-        "NCKU Petrochemical Chimney - Advanced Algorithmic Dashboard",
-        annotated_frame,
-    )  #[cite: 8]
+    cv2.imshow("NCKU Petrochemical Safety Monitor v2.0", annotated_frame)
+    if cv2.waitKey(wait_ms) & 0xFF == ord("q"):
+      break
 
-    if cv2.waitKey(wait_ms) & 0xFF == ord("q"):  #[cite: 8]
-      break  #[cite: 8]
-
-  cap.release()  #[cite: 8]
-  cv2.destroyAllWindows()  #[cite: 8]
+  cap.release()
+  cv2.destroyAllWindows()
 
 
-if __name__ == "__main__":  #[cite: 8]
-  main()  #[cite: 8]
+if __name__ == "__main__":
+  main()
