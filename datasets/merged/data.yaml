@@ -1,0 +1,14 @@
+# 資料集根目錄絕對路徑
+path: D:/NCKU_paper_Capstone_Project/dataset_merged
+train: images/train
+val: images/val
+
+# 類別數量
+nc: 4
+
+# 統一對齊後的類別映射
+names:
+  0: black_smoky
+  1: chimney
+  2: fire
+  3: white_smoky

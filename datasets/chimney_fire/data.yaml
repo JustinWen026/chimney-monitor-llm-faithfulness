@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['black_smoky', 'chimney', 'fire']
+
+roboflow:
+  workspace: justins-workspace-3mnwz
+  project: chimney-fire-smoke
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/justins-workspace-3mnwz/chimney-fire-smoke/dataset/1

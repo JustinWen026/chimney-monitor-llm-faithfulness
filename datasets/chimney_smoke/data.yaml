@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['black_smoky', 'chimney', 'white_smoky']
+
+roboflow:
+  workspace: justins-workspace-3mnwz
+  project: chimney-l1vf2-wvsig
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/justins-workspace-3mnwz/chimney-l1vf2-wvsig/dataset/2
