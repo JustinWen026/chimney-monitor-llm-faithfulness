@@ -1,7 +1,7 @@
 from datetime import datetime
 import os
 import sqlite3
-from db_manager import DB_PATH, acknowledge_incident, init_db
+from db_manager import DB_PATH, acknowledge_incident, init_db, get_open_critical_count
 import pandas as pd
 from PIL import Image
 import streamlit as st
@@ -20,6 +20,19 @@ st.caption(
     "NCKU CSIE AI Safety Monitor System • Edge-Based Real-time Incident Audit"
     " Trail"
 )
+
+# ==============================================================================
+# 🆘 新增：逾時未處置 CRITICAL 事件升級告警橫幅（Escalation Banner）
+# ==============================================================================
+ESCALATION_MINUTES = 5
+open_critical_count = get_open_critical_count(minutes_threshold=ESCALATION_MINUTES)
+if open_critical_count > 0:
+  st.error(
+      f"🆘 **緊急升級警示**：目前有 {open_critical_count} 件 CRITICAL "
+      f"等級事故已超過 {ESCALATION_MINUTES} 分鐘尚未簽收處置，請立即確認！",
+      icon="🚨",
+  )
+
 st.markdown("---")
 
 
@@ -33,9 +46,9 @@ def load_data():
 df = load_data()
 
 # ==============================================================================
-# 📊 功能 6：工安 KPI 關鍵指標卡片
+# 📊 功能 6：工安 KPI 關鍵指標卡片（v2：新增複合事件計數）
 # ==============================================================================
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 
 total_incidents = len(df)
 pending_count = len(df[df["status"] == "PENDING"]) if not df.empty else 0
@@ -45,7 +58,13 @@ avg_mttr = (
     if not resolved_df.empty and resolved_df["mttr_seconds"].mean() > 0
     else 0.0
 )
-fire_count = len(df[df["event_type"] == "fire"]) if not df.empty else 0
+# 含 fire 字樣的事件（包含單純 fire 與複合 black_smoky+fire）
+fire_involved_count = (
+    len(df[df["event_type"].str.contains("fire", na=False)]) if not df.empty else 0
+)
+composite_count = (
+    len(df[df["event_type"] == "black_smoky+fire"]) if not df.empty else 0
+)
 smoke_count = (
     len(df[df["event_type"].isin(["black_smoky", "white_smoky"])])
     if not df.empty
@@ -55,22 +74,69 @@ smoke_count = (
 col1.metric("🚨 總告警事件數", f"{total_incidents} 次")
 col2.metric("⏳ 待簽收處置 (Pending)", f"{pending_count} 件", delta_color="inverse")
 col3.metric("⏱️ 平均處置時間 (Mean MTTR)", f"{avg_mttr} 秒")
-col4.metric("🔥 火焰/火炬事件", f"{fire_count} 次")
-col5.metric("💨 排煙外溢事件", f"{smoke_count} 次")
+col4.metric("🔥 火焰相關事件", f"{fire_involved_count} 次")
+col5.metric("🆘 複合型高風險事件", f"{composite_count} 次", delta_color="inverse")
+col6.metric("💨 排煙外溢事件", f"{smoke_count} 次")
 
 st.markdown("---")
 
 # ==============================================================================
-# 🔍 功能 7：側邊欄篩選器 (Filter Sidebar)
+# 📈 新增：事故趨勢圖（近 14 日，依日期與事件類型分組）
+# ==============================================================================
+st.subheader("📈 事故趨勢總覽（近 14 日）")
+if df.empty:
+  st.info("目前尚無歷史事件資料，無法繪製趨勢圖。")
+else:
+  trend_df = df.copy()
+  trend_df["date"] = pd.to_datetime(trend_df["timestamp"]).dt.date
+  pivot_df = (
+      trend_df.groupby(["date", "event_type"]).size().unstack(fill_value=0)
+  )
+  # 只取最近 14 天，避免資料量大時圖表過度擁擠
+  pivot_df = pivot_df.tail(14)
+  st.bar_chart(pivot_df)
+
+st.markdown("---")
+
+# ==============================================================================
+# 🖼️ 新增：最新告警縮圖牆（快速一覽最近觸發事件現場畫面）
+# ==============================================================================
+st.subheader("🖼️ 最新告警現場縮圖")
+recent_df = df.head(4) if not df.empty else pd.DataFrame()
+if recent_df.empty:
+  st.info("目前尚無告警紀錄。")
+else:
+  thumb_cols = st.columns(len(recent_df))
+  for idx, (_, row) in enumerate(recent_df.iterrows()):
+    with thumb_cols[idx]:
+      severity_emoji = {
+          "CRITICAL": "🔴",
+          "HIGH": "🟠",
+          "WARNING": "🟡",
+      }.get(row["severity"], "⚪")
+      if row["snapshot_path"] and os.path.exists(row["snapshot_path"]):
+        st.image(Image.open(row["snapshot_path"]), use_container_width=True)
+      else:
+        st.warning("無截圖")
+      st.caption(
+          f"{severity_emoji} #{row['id']} | {row['event_type']} |"
+          f" {row['timestamp'][-8:]}"
+      )
+
+st.markdown("---")
+
+# ==============================================================================
+# 🔍 功能 7：側邊欄篩選器（v2：事件類型改為動態抓取，避免漏掉複合事件選項）
 # ==============================================================================
 st.sidebar.header("🔍 事故篩選與查詢")
 status_filter = st.sidebar.selectbox("處理狀態", ["全部", "PENDING", "RESOLVED"])
 severity_filter = st.sidebar.selectbox(
     "嚴重度等級", ["全部", "CRITICAL", "HIGH", "WARNING"]
 )
-event_filter = st.sidebar.selectbox(
-    "事件類型", ["全部", "fire", "black_smoky", "white_smoky"]
+event_type_options = ["全部"] + (
+    sorted(df["event_type"].unique().tolist()) if not df.empty else []
 )
+event_filter = st.sidebar.selectbox("事件類型", event_type_options)
 
 filtered_df = df.copy()
 if not filtered_df.empty:
@@ -92,19 +158,26 @@ with tab1:
   if filtered_df.empty:
     st.info("目前無符合條件的工安事件紀錄。")
   else:
-    # 格式化顯示表格
-    display_df = filtered_df[[
-        "id",
-        "timestamp",
-        "event_type",
-        "severity",
-        "duration",
-        "status",
-        "ack_time",
-        "mttr_seconds",
-        "operator_notes",
-    ]].copy()
-    st.dataframe(display_df, use_container_width=True, height=280)
+    # v2：色彩標記改用 Styler，直接把嚴重度用底色標出來，比純文字更符合
+    # 「事故嚴重等級色彩標記（Severity Badge）」這項功能的原始需求
+    display_cols = [
+        "id", "timestamp", "event_type", "severity", "risk_level",
+        "duration", "status", "ack_time", "mttr_seconds", "operator_notes",
+    ]
+    display_cols = [c for c in display_cols if c in filtered_df.columns]
+    display_df = filtered_df[display_cols].copy()
+
+    def highlight_severity(row):
+      color_map = {
+          "CRITICAL": "background-color: #ff4b4b; color: white",
+          "HIGH": "background-color: #ff9d45; color: black",
+          "WARNING": "background-color: #ffe08a; color: black",
+      }
+      style = color_map.get(row["severity"], "")
+      return [style if col == "severity" else "" for col in row.index]
+
+    styled_df = display_df.style.apply(highlight_severity, axis=1)
+    st.dataframe(styled_df, use_container_width=True, height=280)
 
     # 功能 4：一鍵匯出日誌報表 (CSV)
     csv_data = filtered_df.to_csv(index=False).encode("utf-8-sig")
