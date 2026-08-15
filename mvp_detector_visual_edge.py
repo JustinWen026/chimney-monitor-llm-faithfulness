@@ -21,10 +21,40 @@ ALERT_THRESHOLD_SEC = 3.0  # 狀態機安全閾值 (秒)
 ALERT_COOLDOWN_SEC = 60.0  # 告警防連發冷卻時間 (秒)
 
 
+def resolve_anomaly_type(detected_classes):
+  """
+  v3：Layer 3 歸因邏輯的偵測端對應版本。
+
+  判斷優先序（由高到低）：
+      1. black_smoky AND fire 同時存在 → "black_smoky+fire"（複合風險，最高優先）
+      2. fire 存在 → "fire"
+      3. black_smoky 存在 → "black_smoky"
+      4. white_smoky 存在 → "white_smoky"
+      5. 皆無 → None
+
+  舊版邏輯只用 next() 抓 detected_classes 裡第一個符合的類別，
+  沒有考慮優先序也沒有處理複合情況，v3 修正這點。
+  """
+  has_fire = "fire" in detected_classes
+  has_black = "black_smoky" in detected_classes
+  has_white = "white_smoky" in detected_classes
+
+  if has_fire and has_black:
+    return "black_smoky+fire"
+  elif has_fire:
+    return "fire"
+  elif has_black:
+    return "black_smoky"
+  elif has_white:
+    return "white_smoky"
+  else:
+    return None
+
+
 def main():
   print(
       f"[{datetime.now().strftime('%H:%M:%S')}] [INIT] 正在初始化 YOLOv11"
-      " 推論引擎 (V2 存證與工安資料庫版)..."
+      " 推論引擎 (V3 複合風險判斷版)..."
   )
   model = YOLO(MODEL_PATH)
   cap = cv2.VideoCapture(VIDEO_PATH)
@@ -68,12 +98,10 @@ def main():
     detected_classes = [
         model.names[int(box.cls[0])] for box in results[0].boxes
     ]
-    target_anomalies = ["fire", "black_smoky", "white_smoky"]
 
-    has_anomaly = any(cls in target_anomalies for cls in detected_classes)
-    current_frame_anomaly = next(
-        (cls for cls in detected_classes if cls in target_anomalies), None
-    )
+    # v3：改用優先序 + 複合風險判斷，取代舊版單純 next() 抓第一個符合類別
+    current_frame_anomaly = resolve_anomaly_type(detected_classes)
+    has_anomaly = current_frame_anomaly is not None
 
     current_time = time.time()
 
@@ -96,10 +124,14 @@ def main():
 
     elif current_state == "ACCUMULATING":
       if has_anomaly:
+        # v3：狀態持續累積期間，若偵測到更高風險組合（例如原本只有黑煙，
+        # 之後火焰也出現形成複合風險），即時更新 active_anomaly_type
+        active_anomaly_type = current_frame_anomaly
         duration = current_time - anomaly_start_time
         print(
             "\r[STATE: ACCUMULATING] ⏳ 異常時間蓄能中:"
-            f" {duration:.2f}s / {ALERT_THRESHOLD_SEC}s... ",
+            f" {duration:.2f}s / {ALERT_THRESHOLD_SEC}s | 類型:"
+            f" {active_anomaly_type}   ",
             end="",
             flush=True,
         )
@@ -108,12 +140,13 @@ def main():
           current_state = "TRIGGERED"
           print(
               f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔥 達到滿載臨界值！狀態跳轉:"
-              " TRIGGERED"
+              f" TRIGGERED ({active_anomaly_type})"
           )
 
           # 📸 功能 3：自動截圖存證
           timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-          snapshot_name = f"snapshot_{timestamp_str}_{active_anomaly_type}.jpg"
+          safe_type_name = active_anomaly_type.replace("+", "_")
+          snapshot_name = f"snapshot_{timestamp_str}_{safe_type_name}.jpg"
           snapshot_full_path = os.path.join(SNAPSHOT_DIR, snapshot_name)
           cv2.imwrite(snapshot_full_path, annotated_frame)
           print(f"📸 [存證存檔] 現場影像已保存至: {snapshot_full_path}")
@@ -148,10 +181,11 @@ def main():
 
     elif current_state == "TRIGGERED":
       if has_anomaly:
+        active_anomaly_type = current_frame_anomaly
         duration = current_time - anomaly_start_time
         print(
             "\r[STATE: TRIGGERED] 🔴 警報持續中！累計異常時間:"
-            f" {duration:.2f}s   ",
+            f" {duration:.2f}s | 類型: {active_anomaly_type}   ",
             end="",
             flush=True,
         )
@@ -227,9 +261,14 @@ def main():
     )
 
     if current_state == "TRIGGERED":
+      alert_label = (
+          "[COMPOSITE CRITICAL]"
+          if active_anomaly_type == "black_smoky+fire"
+          else "[CRITICAL ALERT]"
+      )
       cv2.putText(
           annotated_frame,
-          "[CRITICAL ALERT]",
+          alert_label,
           (10, 110),
           cv2.FONT_HERSHEY_SIMPLEX,
           0.45,
@@ -238,7 +277,7 @@ def main():
           cv2.LINE_AA,
       )
 
-    cv2.imshow("NCKU Petrochemical Safety Monitor v2.0", annotated_frame)
+    cv2.imshow("NCKU Petrochemical Safety Monitor v3.0", annotated_frame)
     if cv2.waitKey(wait_ms) & 0xFF == ord("q"):
       break
 
