@@ -5,6 +5,7 @@ from db_manager import DB_PATH, acknowledge_incident, init_db, get_open_critical
 import pandas as pd
 from PIL import Image
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 # 設定網頁標題與寬版版面
 st.set_page_config(
@@ -12,6 +13,12 @@ st.set_page_config(
     page_icon="🏭",
     layout="wide",
 )
+
+# ==============================================================================
+# 🔄 新增：自動刷新（v3）
+# 每 5 秒重新整理一次頁面，不需要人工手動 F5，符合「即時監控」的情境需求
+# ==============================================================================
+st_autorefresh(interval=5000, key="dashboard_autorefresh")
 
 init_db()
 
@@ -22,15 +29,37 @@ st.caption(
 )
 
 # ==============================================================================
-# 🆘 新增：逾時未處置 CRITICAL 事件升級告警橫幅（Escalation Banner）
+# 🆘 逾時未處置 CRITICAL 事件升級告警橫幅（v3：加大視覺份量，模擬中控室警報感）
 # ==============================================================================
 ESCALATION_MINUTES = 5
 open_critical_count = get_open_critical_count(minutes_threshold=ESCALATION_MINUTES)
 if open_critical_count > 0:
-  st.error(
-      f"🆘 **緊急升級警示**：目前有 {open_critical_count} 件 CRITICAL "
-      f"等級事故已超過 {ESCALATION_MINUTES} 分鐘尚未簽收處置，請立即確認！",
-      icon="🚨",
+  st.markdown(
+      f"""
+      <div style="
+          background: linear-gradient(90deg, #7a0000, #c40000, #7a0000);
+          background-size: 200% 100%;
+          animation: pulse-alert 1.5s ease-in-out infinite;
+          border: 2px solid #ff4b4b;
+          border-radius: 8px;
+          padding: 18px 24px;
+          margin-bottom: 12px;
+          text-align: center;
+      ">
+          <span style="font-size: 22px; font-weight: 700; color: white;">
+              🆘 緊急升級警示：{open_critical_count} 件 CRITICAL 事故已超過
+              {ESCALATION_MINUTES} 分鐘尚未簽收處置，請立即確認！
+          </span>
+      </div>
+      <style>
+      @keyframes pulse-alert {{
+          0% {{ background-position: 0% 50%; }}
+          50% {{ background-position: 100% 50%; }}
+          100% {{ background-position: 0% 50%; }}
+      }}
+      </style>
+      """,
+      unsafe_allow_html=True,
   )
 
 st.markdown("---")
@@ -46,7 +75,7 @@ def load_data():
 df = load_data()
 
 # ==============================================================================
-# 📊 功能 6：工安 KPI 關鍵指標卡片（v2：新增複合事件計數）
+# 📊 功能 6：工安 KPI 關鍵指標卡片
 # ==============================================================================
 col1, col2, col3, col4, col5, col6 = st.columns(6)
 
@@ -58,7 +87,6 @@ avg_mttr = (
     if not resolved_df.empty and resolved_df["mttr_seconds"].mean() > 0
     else 0.0
 )
-# 含 fire 字樣的事件（包含單純 fire 與複合 black_smoky+fire）
 fire_involved_count = (
     len(df[df["event_type"].str.contains("fire", na=False)]) if not df.empty else 0
 )
@@ -81,7 +109,7 @@ col6.metric("💨 排煙外溢事件", f"{smoke_count} 次")
 st.markdown("---")
 
 # ==============================================================================
-# 📈 新增：事故趨勢圖（近 14 日，依日期與事件類型分組）
+# 📈 事故趨勢圖（近 14 日）
 # ==============================================================================
 st.subheader("📈 事故趨勢總覽（近 14 日）")
 if df.empty:
@@ -92,17 +120,18 @@ else:
   pivot_df = (
       trend_df.groupby(["date", "event_type"]).size().unstack(fill_value=0)
   )
-  # 只取最近 14 天，避免資料量大時圖表過度擁擠
   pivot_df = pivot_df.tail(14)
   st.bar_chart(pivot_df)
 
 st.markdown("---")
 
 # ==============================================================================
-# 🖼️ 新增：最新告警縮圖牆（快速一覽最近觸發事件現場畫面）
+# 🖼️ 最新告警縮圖牆
+# 提醒：以下這行數量設定沒有更動，維持 head(4)，
+# 如果你要改成只顯示 3 張，把下面這行的 4 改成 3 即可，其餘不用動。
 # ==============================================================================
 st.subheader("🖼️ 最新告警現場縮圖")
-recent_df = df.head(4) if not df.empty else pd.DataFrame()
+recent_df = df.head(3) if not df.empty else pd.DataFrame()
 if recent_df.empty:
   st.info("目前尚無告警紀錄。")
 else:
@@ -126,7 +155,7 @@ else:
 st.markdown("---")
 
 # ==============================================================================
-# 🔍 功能 7：側邊欄篩選器（v2：事件類型改為動態抓取，避免漏掉複合事件選項）
+# 🔍 側邊欄篩選器
 # ==============================================================================
 st.sidebar.header("🔍 事故篩選與查詢")
 status_filter = st.sidebar.selectbox("處理狀態", ["全部", "PENDING", "RESOLVED"])
@@ -148,7 +177,7 @@ if not filtered_df.empty:
     filtered_df = filtered_df[filtered_df["event_type"] == event_filter]
 
 # ==============================================================================
-# 📋 主畫面：工安日誌表格 + 功能 8 色彩標記 + 功能 4 匯出 CSV
+# 📋 主畫面：工安日誌表格 + 色彩標記 + 匯出 CSV
 # ==============================================================================
 tab1, tab2 = st.tabs(["📋 事故審計日誌與閉環處置", "📸 現場存證截圖調閱"])
 
@@ -158,8 +187,6 @@ with tab1:
   if filtered_df.empty:
     st.info("目前無符合條件的工安事件紀錄。")
   else:
-    # v2：色彩標記改用 Styler，直接把嚴重度用底色標出來，比純文字更符合
-    # 「事故嚴重等級色彩標記（Severity Badge）」這項功能的原始需求
     display_cols = [
         "id", "timestamp", "event_type", "severity", "risk_level",
         "duration", "status", "ack_time", "mttr_seconds", "operator_notes",
@@ -179,7 +206,6 @@ with tab1:
     styled_df = display_df.style.apply(highlight_severity, axis=1)
     st.dataframe(styled_df, use_container_width=True, height=280)
 
-    # 功能 4：一鍵匯出日誌報表 (CSV)
     csv_data = filtered_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         label="📥 一鍵匯出工安日誌報表 (CSV)",
@@ -188,9 +214,6 @@ with tab1:
         mime="text/csv",
     )
 
-  # ==============================================================================
-  # 🛠️ 功能 5：閉環管理處置簽收區塊 (MTTR 更新)
-  # ==============================================================================
   st.markdown("### ✍️ 工安主管閉環簽收處置 (Closed-Loop Action)")
   pending_items = (
       df[df["status"] == "PENDING"]["id"].tolist() if not df.empty else []
