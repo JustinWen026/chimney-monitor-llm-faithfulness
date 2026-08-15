@@ -2,8 +2,10 @@ from datetime import datetime
 import os
 import time
 import cv2
+import threading
 from db_manager import log_incident
 from discord_notifier import send_discord_alert_async
+from report_generator import trigger_report_generation_async
 from ultralytics import YOLO
 
 # ==============================================================================
@@ -162,6 +164,11 @@ def main():
               f" 狀態: PENDING)"
           )
 
+          # 📝 觸發 MCP + 本地 LLM 背景生成事故初報（非阻塞，不影響推論 FPS）
+          trigger_report_generation_async(
+              incident_id=incident_id, event_type=active_anomaly_type
+          )
+
           # 🚨 Discord 即時非同步發送
           if (current_time - last_alert_time) > ALERT_COOLDOWN_SEC:
             readable_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -283,6 +290,25 @@ def main():
 
   cap.release()
   cv2.destroyAllWindows()
+  print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [EXIT] 影像播放結束，釋放視窗資源。")
+
+  # 等待背景執行緒（報告生成、Discord 通知）完成，避免程式提前退出把任務中斷
+  active_threads = [
+      t for t in threading.enumerate()
+      if t is not threading.main_thread() and t.is_alive()
+  ]
+  if active_threads:
+    print(
+        f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 背景任務（報告生成 / 通知）"
+        " 仍在執行中，請稍候..."
+    )
+    while any(t.is_alive() for t in active_threads):
+      time.sleep(1.0)
+      active_threads = [
+          t for t in threading.enumerate()
+          if t is not threading.main_thread() and t.is_alive()
+      ]
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 所有背景任務已完成。")
 
 
 if __name__ == "__main__":
