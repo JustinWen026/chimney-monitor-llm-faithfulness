@@ -4,25 +4,16 @@ import threading
 import requests
 
 # =====================================================================
-# Discord Webhook 設定區（v2：改為環境變數讀取，不再硬編碼在程式碼裡）
-#
-# 使用方式（Windows PowerShell，設定一次即可，之後每次開終端機都會自動生效）：
-#   [System.Environment]::SetEnvironmentVariable(
-#       "DISCORD_WEBHOOK_URL", "你的webhook網址", "User")
-#
-# 或者只在當前這個 PowerShell 視窗暫時生效（每次重開視窗要重設）：
-#   $env:DISCORD_WEBHOOK_URL = "你的webhook網址"
-#
-# ⚠️ 提醒：舊版 discord_notifier.py 裡的 Webhook 網址已經外流在對話紀錄中，
-# 請務必到 Discord 頻道設定 → 整合 → Webhook，刪除舊的並重新產生一組新的。
+# Discord Webhook 設定區（環境變數讀取，不硬編碼在程式碼裡）
 # =====================================================================
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 
 def _send_discord_worker(
-    timestamp, duration, event_type="煙霧外溢 (Smoky Event)"
+    timestamp, duration, event_type="煙霧外溢 (Smoky Event)",
+    camera_id="CAM-01", density_level=None, occlusion_flag=0,
 ):
-  """實際在背景執行緒中運行的 Discord 發送工作"""
+  """實際在背景執行緒中運行的 Discord 發送工作（v3：新增攝影機來源標示）"""
   if not DISCORD_WEBHOOK_URL:
     print(
         f"\n[{datetime.now().strftime('%H:%M:%S')}] ⚠️ [Discord] 尚未設定"
@@ -30,7 +21,6 @@ def _send_discord_worker(
     )
     return
 
-  # 事件中文名稱映射（v2：新增複合事件）
   event_map = {
       "black_smoky+fire": "🆘 複合型高風險事故：疑似火災或爆燃 (Composite Critical Event)",
       "fire": "🔥 煙囪起火燃燒 (Chimney Flare/Fire)",
@@ -39,6 +29,20 @@ def _send_discord_worker(
   }
   event_display = event_map.get(event_type, event_type)
   is_composite = "black_smoky" in event_type and "fire" in event_type
+
+  extra_fields = [
+      {"name": "📷 攝影機來源", "value": camera_id, "inline": True},
+  ]
+  if density_level:
+    extra_fields.append(
+        {"name": "🌫️ 濃度等級", "value": density_level, "inline": True}
+    )
+  if occlusion_flag:
+    extra_fields.append({
+        "name": "⚠️ 特別提醒",
+        "value": "本次事件觸發時未偵測到煙囪主體，可能為廠區其他位置起火或視角遮蔽情境，建議加派人力現場確認。",
+        "inline": False,
+    })
 
   payload = {
       "username": "石化園區 AI 偵測系統",
@@ -50,9 +54,9 @@ def _send_discord_worker(
               else "🚨 系統安全核心告警：偵測到煙囪異常事件 🚨"
           ),
           "description": (
-              "系統偵測到廠區煙囪異常持續時間已達臨界值，已自動歸因並觸發主動防護通報機制。"
+              "系統偵測到廠區異常持續時間已達臨界值，已自動歸因並觸發主動防護通報機制。"
           ),
-          "color": 10038562 if is_composite else 15158332,  # 複合事件用更深的暗紅色區隔
+          "color": 10038562 if is_composite else 15158332,
           "fields": [
               {
                   "name": "📌 專案名稱",
@@ -67,6 +71,7 @@ def _send_discord_worker(
                   "value": f"`{duration} 秒` (門檻: 3.0秒)",
                   "inline": True,
               },
+              *extra_fields,
               {"name": "⏰ 觸發時間", "value": timestamp, "inline": False},
               {
                   "name": "🔴 安全狀態",
@@ -83,7 +88,7 @@ def _send_discord_worker(
     if response.status_code in [200, 204]:
       print(
           f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔔 [Discord成功]"
-          " 告警卡片已送達 Discord 頻道！"
+          f" ({camera_id}) 告警卡片已送達 Discord 頻道！"
       )
     else:
       print(
@@ -97,11 +102,14 @@ def _send_discord_worker(
     )
 
 
-def send_discord_alert_async(timestamp, duration, event_type="smoke"):
+def send_discord_alert_async(
+    timestamp, duration, event_type="smoke",
+    camera_id="CAM-01", density_level=None, occlusion_flag=0,
+):
   """外部接口：採用非阻塞執行緒發送，確保主推論迴圈維持極高 FPS"""
   thread = threading.Thread(
       target=_send_discord_worker,
-      args=(timestamp, duration, event_type),
+      args=(timestamp, duration, event_type, camera_id, density_level, occlusion_flag),
       daemon=True,
   )
   thread.start()
