@@ -3,9 +3,6 @@ import os
 import threading
 import requests
 
-# =====================================================================
-# Discord Webhook 設定區（環境變數讀取，不硬編碼在程式碼裡）
-# =====================================================================
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 
@@ -13,7 +10,7 @@ def _send_discord_worker(
     timestamp, duration, event_type="煙霧外溢 (Smoky Event)",
     camera_id="CAM-01", density_level=None, occlusion_flag=0,
 ):
-  """實際在背景執行緒中運行的 Discord 發送工作（v3：新增攝影機來源標示）"""
+  """實際在背景執行緒中運行的 Discord 發送工作（v4：遮蔽提示文字更清楚）"""
   if not DISCORD_WEBHOOK_URL:
     print(
         f"\n[{datetime.now().strftime('%H:%M:%S')}] ⚠️ [Discord] 尚未設定"
@@ -39,8 +36,13 @@ def _send_discord_worker(
     )
   if occlusion_flag:
     extra_fields.append({
-        "name": "⚠️ 特別提醒",
-        "value": "本次事件觸發時未偵測到煙囪主體，可能為廠區其他位置起火或視角遮蔽情境，建議加派人力現場確認。",
+        "name": "📍 位置確認提醒",
+        "value": (
+            "本次觸發時未於畫面中偵測到煙囪主體。\n"
+            "可能原因：(1) 事件發生於煙囪以外之廠區位置，"
+            "或 (2) 攝影機視角遭遮蔽物阻擋。\n"
+            "👉 建議現場人員實際確認起火/排煙位置。"
+        ),
         "inline": False,
     })
 
@@ -106,7 +108,6 @@ def send_discord_alert_async(
     timestamp, duration, event_type="smoke",
     camera_id="CAM-01", density_level=None, occlusion_flag=0,
 ):
-  """外部接口：採用非阻塞執行緒發送，確保主推論迴圈維持極高 FPS"""
   thread = threading.Thread(
       target=_send_discord_worker,
       args=(timestamp, duration, event_type, camera_id, density_level, occlusion_flag),

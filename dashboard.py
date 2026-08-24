@@ -66,7 +66,7 @@ def load_data():
 df = load_data()
 
 # ==============================================================================
-# 📊 工安 KPI 關鍵指標卡片（v4：新增攝影機路數）
+# 📊 工安 KPI 關鍵指標卡片（v5：遮蔽情境卡片加上 help 提示說明）
 # ==============================================================================
 col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
 
@@ -94,14 +94,19 @@ col2.metric("⏳ 待簽收處置", f"{pending_count} 件", delta_color="inverse"
 col3.metric("⏱️ 平均處置時間", f"{avg_mttr} 秒")
 col4.metric("🔥 火焰相關事件", f"{fire_involved_count} 次")
 col5.metric("🆘 複合型高風險", f"{composite_count} 次", delta_color="inverse")
-col6.metric("👁️ 疑似遮蔽情境", f"{occlusion_count} 次")
+col6.metric(
+    "👁️ 需確認位置事件",
+    f"{occlusion_count} 次",
+    help=(
+        "觸發告警當下，畫面中未偵測到煙囪主體的事件數。"
+        "可能代表異常發生於煙囪以外的廠區位置，或攝影機視角被遮蔽物擋住，"
+        "建議這類事件優先派人現場確認實際起火/排煙位置。"
+    ),
+)
 col7.metric("📷 監控攝影機路數", f"{camera_count} 路")
 
 st.markdown("---")
 
-# ==============================================================================
-# 📈 事故趨勢圖（近 14 日）
-# ==============================================================================
 st.subheader("📈 事故趨勢總覽（近 14 日）")
 if df.empty:
   st.info("目前尚無歷史事件資料，無法繪製趨勢圖。")
@@ -114,9 +119,6 @@ else:
 
 st.markdown("---")
 
-# ==============================================================================
-# 🖼️ 最新告警縮圖牆
-# ==============================================================================
 st.subheader("🖼️ 最新告警現場縮圖")
 recent_df = df.head(3) if not df.empty else pd.DataFrame()
 if recent_df.empty:
@@ -130,7 +132,7 @@ else:
         st.image(Image.open(row["snapshot_path"]), use_container_width=True)
       else:
         st.warning("無截圖")
-      occlusion_tag = " 👁️遮蔽" if row.get("occlusion_flag") == 1 else ""
+      occlusion_tag = " ⚠️需確認位置" if row.get("occlusion_flag") == 1 else ""
       st.caption(
           f"{severity_emoji} #{row['id']} | {row.get('camera_id', 'CAM-01')} |"
           f" {row['event_type']}{occlusion_tag} | {row['timestamp'][-8:]}"
@@ -138,9 +140,6 @@ else:
 
 st.markdown("---")
 
-# ==============================================================================
-# 🔍 側邊欄篩選器（v4：新增攝影機篩選）
-# ==============================================================================
 st.sidebar.header("🔍 事故篩選與查詢")
 camera_options = ["全部"] + get_camera_list()
 camera_filter = st.sidebar.selectbox("📷 攝影機來源", camera_options)
@@ -160,9 +159,6 @@ if not filtered_df.empty:
   if event_filter != "全部":
     filtered_df = filtered_df[filtered_df["event_type"] == event_filter]
 
-# ==============================================================================
-# 📋 主畫面：工安日誌表格 + 色彩標記 + 匯出 CSV
-# ==============================================================================
 tab1, tab2 = st.tabs(["📋 事故審計日誌與閉環處置", "📸 現場存證截圖調閱"])
 
 with tab1:
@@ -179,7 +175,9 @@ with tab1:
     display_cols = [c for c in display_cols if c in filtered_df.columns]
     display_df = filtered_df[display_cols].copy()
     if "occlusion_flag" in display_df.columns:
-      display_df["occlusion_flag"] = display_df["occlusion_flag"].map({1: "⚠️ 是", 0: "否"})
+      display_df["occlusion_flag"] = display_df["occlusion_flag"].map(
+          {1: "⚠️ 需確認位置", 0: "✅ 正常"}
+      )
 
     def highlight_severity(row):
       color_map = {
@@ -191,7 +189,21 @@ with tab1:
       return [style if col == "severity" else "" for col in row.index]
 
     styled_df = display_df.style.apply(highlight_severity, axis=1)
-    st.dataframe(styled_df, use_container_width=True, height=280)
+    st.dataframe(
+        styled_df,
+        use_container_width=True,
+        height=280,
+        column_config={
+            "occlusion_flag": st.column_config.TextColumn(
+                "位置確認",
+                help=(
+                    "「⚠️ 需確認位置」代表觸發當下畫面中沒看到煙囪主體，"
+                    "可能是廠區其他位置起火，或攝影機視角被遮蔽物擋住，"
+                    "建議優先派人現場確認實際位置。"
+                ),
+            ),
+        } if "occlusion_flag" in display_cols else None,
+    )
 
     csv_data = filtered_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
@@ -233,7 +245,7 @@ with tab2:
 
     if img_path and os.path.exists(img_path):
       occlusion_note = (
-          "⚠️ 未偵測到煙囪主體，疑似遮蔽或非煙囪場景 | "
+          "⚠️ 需確認位置（未偵測到煙囪主體） | "
           if selected_row.get("occlusion_flag") == 1
           else ""
       )
