@@ -14,14 +14,6 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 
 server_params = StdioServerParameters(command="python", args=["mcp_server.py"])
 
-# ==============================================================================
-# 【BERTScore 問題修正】
-# 上一版把候選/參考文字截到 800 字元，但這個長度不夠——bert_score 套件內部有個
-# 已知 bug，某個型別容量上限大約落在 255 個 token 左右，而中文用 BERT 系列
-# tokenizer 斷詞幾乎是「一個中文字一個 token」，800 字換算下來遠遠超過這個上限，
-# 等於根本沒截到安全範圍。這裡改成截到 200 字元，換算 token 數才會穩穩落在
-# 安全範圍內，才能真正避開 int too big to convert 這個錯誤。
-# ==============================================================================
 BERTSCORE_SAFE_LENGTH = 200
 
 REFERENCE_REPORTS = {
@@ -56,6 +48,36 @@ REFERENCE_REPORTS = {
 }
 
 _report_lock = threading.Lock()
+
+# ==============================================================================
+# 【BERTScore 根本修正】
+# 真正病灶：hfl/chinese-roberta-wwm-ext 的 tokenizer 設定沒有明確指定最大長度，
+# Hugging Face 會用一個代表「無上限」的超大整數頂替，這個數字傳進底層 enable_truncation
+# 時會直接溢位。use_fast_tokenizer=False 這個參數在目前版本沒有確實生效，
+# 所以改用更直接的做法：攔截 AutoTokenizer.from_pretrained 這個載入函式，
+# 载入完成後強制把 model_max_length 改成合理的 512，不管走哪條內部路徑都會
+# 先經過這層修正，徹底避開溢位問題。
+# ==============================================================================
+_tokenizer_patched = False
+
+
+def _ensure_tokenizer_patch():
+    global _tokenizer_patched
+    if _tokenizer_patched:
+        return
+
+    import transformers
+
+    _original_from_pretrained = transformers.AutoTokenizer.from_pretrained.__func__
+
+    def _patched_from_pretrained(cls, *args, **kwargs):
+        tokenizer = _original_from_pretrained(cls, *args, **kwargs)
+        if getattr(tokenizer, "model_max_length", 0) > 100000:
+            tokenizer.model_max_length = 512
+        return tokenizer
+
+    transformers.AutoTokenizer.from_pretrained = classmethod(_patched_from_pretrained)
+    _tokenizer_patched = True
 
 
 async def _generate_report_async(incident_id: int, event_type: str):
@@ -138,16 +160,10 @@ async def _generate_report_async(incident_id: int, event_type: str):
     reference_text = REFERENCE_REPORTS.get(event_type)
     if reference_text and full_text.strip():
         try:
+            _ensure_tokenizer_patch()
             from bert_score import score
             safe_candidate = full_text[:BERTSCORE_SAFE_LENGTH]
             safe_reference = reference_text[:BERTSCORE_SAFE_LENGTH]
-            # 【新修正】Windows 上 bert_score 預設的多程序斷詞（multiprocessing）
-            # 是這類詭異型別錯誤的常見根因，跟文字長度無關。改為 nthreads=1
-            # 強制單一程序執行，避開 Windows 跨程序資料傳遞的已知問題。
-            # 【真正根因修正】hfl/chinese-roberta-wwm-ext 的 tokenizer 設定檔
-            # 沒有明確指定最大長度，Rust 版快速 tokenizer 內部用來代表「無上限」
-            # 的預設值太大，傳進底層函式時直接溢位。改用 use_fast_tokenizer=False
-            # 走純 Python 版 tokenizer，不會呼叫到那個會爆掉的函式。
             P, R, F1 = score(
                 [safe_candidate],
                 [safe_reference],
@@ -157,7 +173,6 @@ async def _generate_report_async(incident_id: int, event_type: str):
                 device="cuda",
                 nthreads=1,
                 batch_size=1,
-                use_fast_tokenizer=False,
             )
             print(
                 f"📊 [BERTScore] Precision={P.item():.4f}  "
