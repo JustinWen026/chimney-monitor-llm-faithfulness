@@ -19,7 +19,6 @@ MODEL_PATH = os.path.join(
 SNAPSHOT_DIR = os.path.join(PROJECT_ROOT, "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
-# 【功能 2：多攝影機】自行編輯這個字典即可新增/移除攝影機來源，不需要改其他程式碼
 CAMERA_SOURCES = {
     "CAM-01": os.path.join(PROJECT_ROOT, "PixVerse_Clean_Slow.mp4"),
     "CAM-02": os.path.join(PROJECT_ROOT, "clean_video_perfect.mp4"),
@@ -28,24 +27,35 @@ CAMERA_SOURCES = {
 ALERT_THRESHOLD_SEC = 3.0
 ALERT_COOLDOWN_SEC = 60.0
 
-# ------------------------------------------------------------------------------
-# 【功能 10：影片前處理 + 雙畫面比較】
-# ENABLE_PREPROCESS：是否對送進模型判斷的畫面做前處理（對比度/亮度調整）
-# SHOW_SIDE_BY_SIDE：是否在同一個視窗左右並排顯示「原始畫面」與「前處理後畫面」
-#   左邊＝原始畫面（純比較用，不影響偵測）
-#   右邊＝前處理後畫面（模型實際拿這張去判斷、觸發告警都以這邊為準）
-# ------------------------------------------------------------------------------
+CONFIDENCE_THRESHOLD = 0.5
+
 ENABLE_PREPROCESS = True
 SHOW_SIDE_BY_SIDE = True
-PREPROCESS_ALPHA = 1.2
-PREPROCESS_BETA = 20
+PREPROCESS_ALPHA = 1.1
+PREPROCESS_BETA = 10
 
-# 【功能 8：反光防誤判】
 GLARE_BRIGHTNESS_THRESHOLD = 240
 GLARE_HOT_PIXEL_RATIO = 0.6
 GLARE_MAX_BOX_AREA_RATIO = 0.02
 
+LAPLACIAN_REFERENCE_MAX = 500.0
+DENSITY_HEAVY_THRESHOLD = 0.6
+DENSITY_MODERATE_THRESHOLD = 0.35
+
 print_lock = threading.Lock()
+
+# ------------------------------------------------------------------------------
+# 【多視窗顯示問題修正】
+# Windows 上 cv2.imshow 不是為多執行緒設計的，多支攝影機各自的執行緒
+# 直接呼叫 imshow 常常只有其中一個視窗能正常顯示。
+# 修正方式：處理執行緒只負責運算並把畫面放進這個共用字典，
+# 實際的 imshow / waitKey / destroyWindow 全部統一交給主執行緒處理。
+# ------------------------------------------------------------------------------
+latest_frames = {}
+frames_lock = threading.Lock()
+stop_event = threading.Event()
+finished_cameras = set()
+finished_lock = threading.Lock()
 
 
 def safe_print(camera_id, message):
@@ -70,10 +80,28 @@ def resolve_anomaly_type(detected_classes):
     return None
 
 
-def classify_smoke_density(box_area_ratio):
-  if box_area_ratio >= 0.15:
+def compute_density_score(frame, box_xyxy):
+  x1, y1, x2, y2 = [int(v) for v in box_xyxy]
+  h, w = frame.shape[:2]
+  x1, y1 = max(0, x1), max(0, y1)
+  x2, y2 = min(w, x2), min(h, y2)
+  if x2 <= x1 or y2 <= y1:
+    return 0.0
+
+  area_ratio = ((x2 - x1) * (y2 - y1)) / (w * h)
+  area_score = min(area_ratio / 0.2, 1.0)
+
+  crop_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+  laplacian_var = cv2.Laplacian(crop_gray, cv2.CV_64F).var()
+  opacity_score = 1.0 - min(laplacian_var / LAPLACIAN_REFERENCE_MAX, 1.0)
+
+  return 0.5 * area_score + 0.5 * opacity_score
+
+
+def classify_smoke_density(density_score):
+  if density_score >= DENSITY_HEAVY_THRESHOLD:
     return "濃烈"
-  elif box_area_ratio >= 0.05:
+  elif density_score >= DENSITY_MODERATE_THRESHOLD:
     return "中等"
   else:
     return "輕微"
@@ -99,11 +127,6 @@ def is_likely_glare(frame, box_xyxy):
 
 
 def build_occlusion_message(occlusion_flag):
-  """
-  【功能 1：遮蔽情境判斷 - 呈現改善】
-  把「有沒有看到煙囪」這個布林值，翻譯成清楚、可行動的一句話，
-  取代原本語意模糊的「疑似遮蔽情境」標籤。
-  """
   if occlusion_flag:
     return (
         "📍 位置確認提醒：本次觸發時畫面中未偵測到煙囪主體，"
@@ -114,11 +137,18 @@ def build_occlusion_message(occlusion_flag):
 
 
 def process_camera_stream(camera_id, video_path, model):
+  """
+  【重要】這個函式只負責「運算」：讀影格、跑模型、狀態機判斷、寫資料庫。
+  完全不呼叫 cv2.imshow / cv2.waitKey / cv2.destroyWindow 這類 GUI 操作，
+  只把畫好的畫面放進 latest_frames 這個共用字典，交給主執行緒統一顯示。
+  """
   safe_print(camera_id, "[INIT] 正在初始化推論引擎...")
   cap = cv2.VideoCapture(video_path)
 
   if not cap.isOpened():
     safe_print(camera_id, f"❌ 錯誤：無法開啟影片，請確認路徑：{video_path}")
+    with finished_lock:
+      finished_cameras.add(camera_id)
     return
 
   current_state = "NORMAL"
@@ -128,32 +158,26 @@ def process_camera_stream(camera_id, video_path, model):
   last_alert_time = 0.0
 
   video_fps = cap.get(cv2.CAP_PROP_FPS)
-  wait_ms = int(1000 / video_fps) if video_fps > 0 else 30
+  frame_interval = 1.0 / video_fps if video_fps > 0 else 1.0 / 30
 
-  window_name = f"NCKU Petrochemical Safety Monitor - {camera_id}"
-
-  while cap.isOpened():
+  while cap.isOpened() and not stop_event.is_set():
+    loop_start = time.time()
     ret, frame = cap.read()
     if not ret:
       break
 
-    # 【功能 10】保留一份原始畫面純粹供比較顯示用，不影響判斷
     raw_frame = frame.copy()
 
     if ENABLE_PREPROCESS:
-      frame = cv2.convertScaleAbs(
-          frame, alpha=PREPROCESS_ALPHA, beta=PREPROCESS_BETA
-      )
+      frame = cv2.convertScaleAbs(frame, alpha=PREPROCESS_ALPHA, beta=PREPROCESS_BETA)
 
-    # 模型判斷永遠吃「前處理後」的畫面（若 ENABLE_PREPROCESS=False，等同原始畫面）
-    results = model(frame, device=0, verbose=False)
+    results = model(frame, device=0, verbose=False, conf=CONFIDENCE_THRESHOLD)
     annotated_frame = results[0].plot()
 
     boxes = results[0].boxes
     detected_classes_all = [model.names[int(b.cls[0])] for b in boxes]
     has_chimney = "chimney" in detected_classes_all
 
-    valid_classes = []
     anomaly_boxes = []
     for box in boxes:
       cls_name = model.names[int(box.cls[0])]
@@ -161,20 +185,19 @@ def process_camera_stream(camera_id, video_path, model):
         if is_likely_glare(frame, box.xyxy[0].tolist()):
           continue
         anomaly_boxes.append((cls_name, box.xyxy[0].tolist()))
-      valid_classes.append(cls_name)
 
     current_frame_anomaly = resolve_anomaly_type([c for c, _ in anomaly_boxes])
     has_anomaly = current_frame_anomaly is not None
 
     current_density_level = None
+    current_density_score = None
     if anomaly_boxes:
-      h, w = frame.shape[:2]
-      max_ratio = 0.0
+      best_score = 0.0
       for cls_name, xyxy in anomaly_boxes:
-        x1, y1, x2, y2 = xyxy
-        ratio = ((x2 - x1) * (y2 - y1)) / (w * h)
-        max_ratio = max(max_ratio, ratio)
-      current_density_level = classify_smoke_density(max_ratio)
+        score_val = compute_density_score(frame, xyxy)
+        best_score = max(best_score, score_val)
+      current_density_score = best_score
+      current_density_level = classify_smoke_density(best_score)
 
     current_time = time.time()
 
@@ -184,8 +207,6 @@ def process_camera_stream(camera_id, video_path, model):
         current_state = "ACCUMULATING"
         anomaly_start_time = current_time
         active_anomaly_type = current_frame_anomaly
-      else:
-        safe_print(camera_id, "\r🟢 無異常，狀態機守衛中...")
 
     elif current_state == "ACCUMULATING":
       if has_anomaly:
@@ -200,7 +221,8 @@ def process_camera_stream(camera_id, video_path, model):
           safe_print(
               camera_id,
               f"🔥 達到滿載臨界值！狀態跳轉: TRIGGERED "
-              f"({active_anomaly_type}, 濃度:{current_density_level})",
+              f"({active_anomaly_type}, 濃度:{current_density_level}, "
+              f"分數:{current_density_score:.3f})",
           )
           if occlusion_message:
             safe_print(camera_id, occlusion_message)
@@ -254,7 +276,6 @@ def process_camera_stream(camera_id, video_path, model):
         current_state = "NORMAL"
         anomaly_start_time = None
 
-    # UI 視覺化（畫在 annotated_frame 上，這是右半邊要顯示的內容）
     bar_x, bar_y = 10, 40
     bar_width, bar_height = 120, 8
     if current_state == "NORMAL":
@@ -272,38 +293,45 @@ def process_camera_stream(camera_id, video_path, model):
 
     cv2.putText(annotated_frame, f"[{camera_id}] STATE: {current_state}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2, cv2.LINE_AA)
     cv2.putText(annotated_frame, f"Time: {duration:.1f}s / {ALERT_THRESHOLD_SEC}s", (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+
     if current_density_level:
-      density_label_en = {"輕微": "Light", "中等": "Moderate", "濃烈": "Heavy"}.get(current_density_level, current_density_level)
-      cv2.putText(annotated_frame, f"Density: {density_label_en}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+      density_label_en = {"輕微": "Light", "中等": "Moderate", "濃烈": "Heavy"}.get(
+          current_density_level, current_density_level
+      )
+      cv2.putText(annotated_frame, f"Density: {density_label_en} ({current_density_score:.2f})", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
     if current_state == "TRIGGERED":
       alert_label = "[COMPOSITE CRITICAL]" if active_anomaly_type == "black_smoky+fire" else "[CRITICAL ALERT]"
       cv2.putText(annotated_frame, alert_label, (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2, cv2.LINE_AA)
 
-    # 【功能 10】組成左右並排比較畫面
     if ENABLE_PREPROCESS and SHOW_SIDE_BY_SIDE:
       raw_display = raw_frame.copy()
       cv2.putText(raw_display, "ORIGINAL (Comparison Only)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2, cv2.LINE_AA)
       cv2.putText(annotated_frame, "PREPROCESSED (Detection Basis)", (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-      # 確保左右高度一致才能拼接
       if raw_display.shape[0] != annotated_frame.shape[0]:
         raw_display = cv2.resize(raw_display, (annotated_frame.shape[1], annotated_frame.shape[0]))
       display_frame = cv2.hconcat([raw_display, annotated_frame])
     else:
       display_frame = annotated_frame
 
-    cv2.imshow(window_name, display_frame)
-    if cv2.waitKey(wait_ms) & 0xFF == ord("q"):
-      break
+    # 只把畫面放進共用字典，不在這個執行緒裡呼叫任何 GUI 函式
+    with frames_lock:
+      latest_frames[camera_id] = display_frame
+
+    # 依照這支影片本身的 FPS 控制節奏，不再依賴 cv2.waitKey 來計時
+    elapsed = time.time() - loop_start
+    sleep_time = frame_interval - elapsed
+    if sleep_time > 0:
+      time.sleep(sleep_time)
 
   cap.release()
-  cv2.destroyWindow(window_name)
   safe_print(camera_id, "[EXIT] 影像播放結束，釋放視窗資源。")
+  with finished_lock:
+    finished_cameras.add(camera_id)
 
 
 def main():
-  print(
-      f"[{datetime.now().strftime('%H:%M:%S')}] [INIT] 正在載入 YOLOv11 模型..."
-  )
+  print(f"[{datetime.now().strftime('%H:%M:%S')}] [INIT] 正在載入 YOLOv11 模型...")
   model = YOLO(MODEL_PATH)
 
   camera_threads = []
@@ -316,10 +344,43 @@ def main():
     camera_threads.append(t)
     t.start()
 
+  # ------------------------------------------------------------------------
+  # 【多視窗顯示問題修正】主執行緒統一負責所有視窗的顯示、按鍵偵測、關閉，
+  # 這是 Windows 上唯一穩定可靠的多視窗顯示方式。
+  # ------------------------------------------------------------------------
+  active_windows = set()
+  total_cameras = len(CAMERA_SOURCES)
+
+  while True:
+    with finished_lock:
+      all_done = len(finished_cameras) >= total_cameras
+
+    with frames_lock:
+      current_frames = dict(latest_frames)
+
+    for camera_id, frame in current_frames.items():
+      window_name = f"NCKU Petrochemical Safety Monitor - {camera_id}"
+      cv2.imshow(window_name, frame)
+      active_windows.add(window_name)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
+      print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [使用者中斷] 偵測到 q 鍵，停止所有攝影機串流...")
+      stop_event.set()
+      break
+
+    if all_done:
+      break
+
+    time.sleep(0.01)
+
   for t in camera_threads:
     t.join()
 
+  for window_name in active_windows:
+    cv2.destroyWindow(window_name)
   cv2.destroyAllWindows()
+
   print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [EXIT] 所有攝影機串流已結束。")
 
   active_threads = [

@@ -15,13 +15,15 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 server_params = StdioServerParameters(command="python", args=["mcp_server.py"])
 
 # ==============================================================================
-# 各事件類型的標準參考報告（給 BERTScore 當作 ground truth 使用）
-#
-# 這是「你認為理想中的報告應該長怎樣」的人工範本，語意上要涵蓋：
-# 事件摘要 / 歸因判定 / 風險等級 / 建議處置 / 追蹤建議 五個要素。
-# 建議你之後照自己想要的措辭調整這幾段文字，寫得越貼近你理想中的標準答案，
-# BERTScore 算出來的分數才越有意義（分數本質上是「跟這份參考文本的語意相似度」）。
+# 【BERTScore 問題修正】
+# 上一版把候選/參考文字截到 800 字元，但這個長度不夠——bert_score 套件內部有個
+# 已知 bug，某個型別容量上限大約落在 255 個 token 左右，而中文用 BERT 系列
+# tokenizer 斷詞幾乎是「一個中文字一個 token」，800 字換算下來遠遠超過這個上限，
+# 等於根本沒截到安全範圍。這裡改成截到 200 字元，換算 token 數才會穩穩落在
+# 安全範圍內，才能真正避開 int too big to convert 這個錯誤。
 # ==============================================================================
+BERTSCORE_SAFE_LENGTH = 200
+
 REFERENCE_REPORTS = {
     "fire": (
         "事件摘要：偵測系統於監控畫面中確認煙囪出現明火，判定為火炬異常燃燒事件。"
@@ -57,7 +59,6 @@ _report_lock = threading.Lock()
 
 
 async def _generate_report_async(incident_id: int, event_type: str):
-    """透過 MCP 取得真實結構化事件資料，呼叫本地 LLM 生成事故初報"""
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
@@ -134,14 +135,19 @@ async def _generate_report_async(incident_id: int, event_type: str):
 
     print(f"\n📄 [報告生成完成] 已存至: {report_path}")
 
-    # 有對應事件類型的參考報告，就順便跑一次 BERTScore 評分
     reference_text = REFERENCE_REPORTS.get(event_type)
     if reference_text and full_text.strip():
         try:
             from bert_score import score
-            # 保險截斷，避免超長文本觸發套件的長度溢位問題
-            safe_candidate = full_text[:800]
-            safe_reference = reference_text[:800]
+            safe_candidate = full_text[:BERTSCORE_SAFE_LENGTH]
+            safe_reference = reference_text[:BERTSCORE_SAFE_LENGTH]
+            # 【新修正】Windows 上 bert_score 預設的多程序斷詞（multiprocessing）
+            # 是這類詭異型別錯誤的常見根因，跟文字長度無關。改為 nthreads=1
+            # 強制單一程序執行，避開 Windows 跨程序資料傳遞的已知問題。
+            # 【真正根因修正】hfl/chinese-roberta-wwm-ext 的 tokenizer 設定檔
+            # 沒有明確指定最大長度，Rust 版快速 tokenizer 內部用來代表「無上限」
+            # 的預設值太大，傳進底層函式時直接溢位。改用 use_fast_tokenizer=False
+            # 走純 Python 版 tokenizer，不會呼叫到那個會爆掉的函式。
             P, R, F1 = score(
                 [safe_candidate],
                 [safe_reference],
@@ -149,19 +155,28 @@ async def _generate_report_async(incident_id: int, event_type: str):
                 model_type="hfl/chinese-roberta-wwm-ext",
                 num_layers=12,
                 device="cuda",
+                nthreads=1,
+                batch_size=1,
+                use_fast_tokenizer=False,
             )
             print(
                 f"📊 [BERTScore] Precision={P.item():.4f}  "
                 f"Recall={R.item():.4f}  F1={F1.item():.4f}"
             )
+            print(
+                f"   （註：評分僅取報告前 {BERTSCORE_SAFE_LENGTH} 字元，"
+                "受套件長文本限制所致，通常涵蓋事件摘要與歸因判定部分）"
+            )
         except Exception as e:
+            import traceback
             print(f"⚠️ [BERTScore 評分失敗]: {e}")
+            print("完整錯誤追蹤（若問題持續，請把以下內容整段貼給我排查）：")
+            traceback.print_exc()
     else:
         print(f"⚠️ 事件類型「{event_type}」尚無對應的參考報告，略過 BERTScore 評分。")
 
 
 def trigger_report_generation_async(incident_id: int, event_type: str):
-    """外部接口：非阻塞方式在背景生成報告，不影響主推論迴圈 FPS"""
     if not _report_lock.acquire(blocking=False):
         print("\n⚠️ [報告生成] 上一份報告仍在生成中，跳過本次觸發。")
         return
@@ -176,5 +191,4 @@ def trigger_report_generation_async(incident_id: int, event_type: str):
 
 
 if __name__ == "__main__":
-    # 獨立測試：假設資料庫裡已經有至少一筆事件紀錄
     asyncio.run(_generate_report_async(incident_id=1, event_type="black_smoky"))
