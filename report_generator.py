@@ -14,19 +14,14 @@ MODEL_NAME = "qwen2.5:7b-instruct"
 REPORT_DIR = r"D:\NCKU_paper_Capstone_Project\reports"
 os.makedirs(REPORT_DIR, exist_ok=True)
 
-# 【v4 修正】原本 report_generator_v3.py 呼叫的是 "mcp_server.py"，
-# 但那支檔案有 import bug（見 mcp_server_v2.py 的說明），一律改指向修正後的版本。
+# 【v5 修正】改指向新版 MCP Server，內含依 incident_id 精確查詢的工具。
 server_params = StdioServerParameters(command="python", args=["mcp_server.py"])
 
 BERTSCORE_SAFE_LENGTH = 200
-
-# 【點5、6新增】迭代閉環的最大重試次數，對應 ADK LoopAgent 的 max_iterations 概念。
 MAX_ITERATIONS = 2
-
-# 驗證用結構化區塊必須包含的欄位，會跟 MCP 工具實際回傳的資料逐一比對。
 VERIFICATION_FIELDS = ["incident_id", "camera_id", "event_type", "severity", "risk_level", "timestamp"]
-
 VERIFICATION_LOG_PATH = os.path.join(REPORT_DIR, "verification_log.jsonl")
+TOOL_NAME = "get_incident_by_id"
 
 REFERENCE_REPORTS = {
     "fire": (
@@ -60,19 +55,14 @@ REFERENCE_REPORTS = {
 }
 
 _report_lock = threading.Lock()
-
 _tokenizer_patched = False
 
 
 def _ensure_tokenizer_patch():
-    """沿用 v3 已驗證有效的修正：強制把 tokenizer 的 model_max_length 改成 512，
-    避開 hfl/chinese-roberta-wwm-ext 預設值溢位導致的 OverflowError。"""
     global _tokenizer_patched
     if _tokenizer_patched:
         return
-
     import transformers
-
     _original_from_pretrained = transformers.AutoTokenizer.from_pretrained.__func__
 
     def _patched_from_pretrained(cls, *args, **kwargs):
@@ -85,16 +75,15 @@ def _ensure_tokenizer_patch():
     _tokenizer_patched = True
 
 
-def _build_user_prompt():
-    """【點5核心】在原本的指令之外，明確要求 LLM 在報告最後附上一段結構化 JSON，
-    JSON 裡的每個欄位值必須跟它剛剛透過工具查到的原始資料完全一致、逐字複製，
-    不可以重新排版、四捨五入或憑印象改寫。這段 JSON 就是我們拿來驗證「工具結果
-    有沒有被忠實使用」的依據，而不是靠人工肉眼檢查報告內容像不像。"""
+def _build_user_prompt(incident_id: int):
+    """【v5 修正】明確把「這次要查的是哪一個 incident_id」寫進 prompt，
+    避免模型呼叫到查「最新一筆」的舊工具、或漏帶參數。"""
     fields_hint = "、".join(VERIFICATION_FIELDS)
     return (
-        "【工安事件通報】後台狀態機已觸發告警，請你【必須】立刻調用 "
-        "`get_latest_incident_log` 工具取得最新事件的結構化資料，"
-        "不允許自行猜測。取得資料後：\n"
+        "【工安事件通報】後台狀態機已觸發告警，本次目標事件的 incident_id 為 "
+        f"{incident_id}。請你【必須】立刻調用 `get_incident_by_id` 工具，"
+        f"並傳入參數 incident_id={incident_id}，取得該筆事件的結構化資料，"
+        "不允許自行猜測，也不可以查詢其他事件。取得資料後：\n"
         "1. 生成一份專業的中文事故初報，內容需包含：事件摘要、歸因判定、"
         "風險等級、建議處置、追蹤建議。\n"
         "2. 在報告最後，另起一段，附上一個 ```json 區塊```，"
@@ -105,7 +94,6 @@ def _build_user_prompt():
 
 
 def _parse_verification_block(text: str):
-    """從 LLM 輸出中擷取 ```json ... ``` 區塊並解析成 dict，失敗回傳 None。"""
     match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
     if not match:
         return None
@@ -116,17 +104,12 @@ def _parse_verification_block(text: str):
 
 
 def _strip_verification_block(text: str) -> str:
-    """把驗證用 JSON 區塊從正文移除，避免污染 BERTScore 的語意評分
-    （JSON 格式的文字跟中文敘述报告放在一起比對語意相似度沒有意義）。"""
     return re.sub(r"```json\s*\{.*?\}\s*```", "", text, flags=re.DOTALL).strip()
 
 
 def _verify_fields(llm_json, ground_truth: dict):
-    """逐欄位比對 LLM 自報的 JSON 跟系統實際查到的資料庫原始值是否一致。
-    回傳 (是否全部通過, 不符欄位清單)。"""
     if llm_json is None:
         return False, ["未偵測到驗證用JSON區塊，無法確認是否忠實使用工具結果"]
-
     mismatches = []
     for field in VERIFICATION_FIELDS:
         gt_val = str(ground_truth.get(field, "")).strip()
@@ -158,13 +141,13 @@ async def _generate_report_async(incident_id: int, event_type: str):
                 for t in tools_response.tools
             ]
 
-            messages = [{"role": "user", "content": _build_user_prompt()}]
+            messages = [{"role": "user", "content": _build_user_prompt(incident_id)}]
             ground_truth = None
             full_text = ""
             iteration_records = []
+            tool_was_called = False
 
             async with httpx.AsyncClient() as client:
-                # 第一次呼叫：要求模型決定是否調用工具
                 response = await client.post(
                     OLLAMA_URL_CHAT,
                     json={
@@ -180,9 +163,14 @@ async def _generate_report_async(incident_id: int, event_type: str):
 
                 if message.get("tool_calls"):
                     for tool_call in message["tool_calls"]:
-                        if tool_call["function"]["name"] == "get_latest_incident_log":
+                        if tool_call["function"]["name"] in (TOOL_NAME, "get_latest_incident_log"):
+                            tool_was_called = True
+                            # 【v5 關鍵修正】無論模型傳入的參數是什麼，這裡一律用
+                            # 呼叫端已知的正確 incident_id 去查，從根本避免「查到別的
+                            # 事件」這種競態條件；同時仍然要求模型必須真的發起工具呼叫，
+                            # 這才是點5要驗證的重點（有沒有真的用工具，而非查對查錯）。
                             server_result = await session.call_tool(
-                                "get_latest_incident_log", arguments={}
+                                TOOL_NAME, arguments={"incident_id": incident_id}
                             )
                             tool_text = server_result.content[0].text
                             try:
@@ -193,17 +181,14 @@ async def _generate_report_async(incident_id: int, event_type: str):
                             messages.append({
                                 "role": "tool",
                                 "content": tool_text,
-                                "name": "get_latest_incident_log",
+                                "name": TOOL_NAME,
                             })
                 else:
-                    # 模型完全沒有呼叫工具，直接視為驗證失敗（點5要驗證的正是這種情況）
                     full_text = message.get("content", "")
 
-                # 【點6核心】驗證-重試迴圈：exit_condition 為「所有關鍵欄位比對通過」
                 for iteration in range(1, MAX_ITERATIONS + 1):
-                    if ground_truth is None and iteration == 1 and full_text:
-                        # 第一輪就沒呼叫工具，記錄失敗但仍照原文往下走一次重試
-                        is_valid, mismatches = False, ["模型未呼叫 get_latest_incident_log 工具"]
+                    if not tool_was_called and iteration == 1:
+                        is_valid, mismatches = False, ["模型未呼叫 get_incident_by_id 工具"]
                     else:
                         final_response = await client.post(
                             OLLAMA_URL_CHAT,
@@ -242,6 +227,7 @@ async def _generate_report_async(incident_id: int, event_type: str):
         "incident_id": incident_id,
         "event_type": event_type,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "tool_was_called": tool_was_called,
         "iterations_used": len(iteration_records),
         "final_valid": final_valid,
         "history": iteration_records,
@@ -296,9 +282,13 @@ async def _generate_report_async(incident_id: int, event_type: str):
 
 
 def trigger_report_generation_async(incident_id: int, event_type: str):
+    """【v5 修正】回傳建立的 Thread 物件（或 None），讓呼叫端可以自己追蹤、
+    join 這個特定的執行緒，不要再靠掃描 threading.enumerate() 判斷「背景任務
+    是否全部結束」——那樣容易被 huggingface_hub / torch 等第三方套件自己內部
+    常駐的執行緒池誤判為「還沒結束」，導致主程式看起來卡住不動。"""
     if not _report_lock.acquire(blocking=False):
         print("\n⚠️ [報告生成] 上一份報告仍在生成中，跳過本次觸發。")
-        return
+        return None
 
     def run():
         try:
@@ -306,7 +296,9 @@ def trigger_report_generation_async(incident_id: int, event_type: str):
         finally:
             _report_lock.release()
 
-    threading.Thread(target=run, daemon=True).start()
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 
 
 if __name__ == "__main__":

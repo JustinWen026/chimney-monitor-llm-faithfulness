@@ -44,6 +44,13 @@ DENSITY_MODERATE_THRESHOLD = 0.35
 
 print_lock = threading.Lock()
 
+# 【v7 修正】原本用 threading.enumerate() 掃描「所有存活執行緒」來判斷背景任務
+# 是否跑完，這個做法會被 huggingface_hub / torch 等第三方套件內部常駐、不會
+# 主動結束的執行緒池誤判，導致主程式跑完偵測後卡住不動，要手動 Ctrl+C 才能繼續。
+# 改成只追蹤「我們自己真正建立」的報告生成執行緒，只等這些跑完即可。
+report_threads = []
+report_threads_lock = threading.Lock()
+
 # ------------------------------------------------------------------------------
 # 【多視窗顯示問題修正】
 # Windows 上 cv2.imshow 不是為多執行緒設計的，多支攝影機各自的執行緒
@@ -247,9 +254,12 @@ def process_camera_stream(camera_id, video_path, model):
               f"💾 [SQL資料庫] 已新增工安紀錄 (ID: #{incident_id}, 狀態: PENDING)",
           )
 
-          trigger_report_generation_async(
+          new_report_thread = trigger_report_generation_async(
               incident_id=incident_id, event_type=active_anomaly_type
           )
+          if new_report_thread is not None:
+            with report_threads_lock:
+              report_threads.append(new_report_thread)
 
           if (current_time - last_alert_time) > ALERT_COOLDOWN_SEC:
             readable_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -383,22 +393,29 @@ def main():
 
   print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [EXIT] 所有攝影機串流已結束。")
 
-  active_threads = [
-      t for t in threading.enumerate()
-      if t is not threading.main_thread() and t.is_alive()
-  ]
-  if active_threads:
+  with report_threads_lock:
+    pending_threads = [t for t in report_threads if t.is_alive()]
+
+  if pending_threads:
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 背景任務（報告生成 / 通知）"
-        " 仍在執行中，請稍候..."
+        f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 還有 {len(pending_threads)} "
+        "個報告生成任務仍在執行中，請稍候..."
     )
-    while any(t.is_alive() for t in active_threads):
-      time.sleep(1.0)
-      active_threads = [
-          t for t in threading.enumerate()
-          if t is not threading.main_thread() and t.is_alive()
-      ]
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 所有背景任務已完成。")
+    # 逾時保護：每份報告含 LLM 生成 + BERTScore 評分，正常情況下不會超過幾分鐘，
+    # 給每個執行緒最多 180 秒，超過就不再等待，避免真的遇到異常卡死時無法結束程式。
+    for t in pending_threads:
+      t.join(timeout=180)
+    still_alive = [t for t in pending_threads if t.is_alive()]
+    if still_alive:
+      print(
+          f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ 有 {len(still_alive)} "
+          "個報告生成任務逾時仍未結束，已不再等待（可能是 LLM 或 BERTScore 端異常，"
+          "建議之後檢查 reports/verification_log.jsonl 確認該筆是否有正常寫入）。"
+      )
+    else:
+      print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 所有報告生成任務已完成。")
+  else:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 沒有仍在執行中的報告生成任務。")
 
 
 if __name__ == "__main__":
