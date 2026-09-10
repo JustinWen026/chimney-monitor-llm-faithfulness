@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+import re
 import threading
 from datetime import datetime
 
@@ -12,9 +14,19 @@ MODEL_NAME = "qwen2.5:7b-instruct"
 REPORT_DIR = r"D:\NCKU_paper_Capstone_Project\reports"
 os.makedirs(REPORT_DIR, exist_ok=True)
 
+# 【v4 修正】原本 report_generator_v3.py 呼叫的是 "mcp_server.py"，
+# 但那支檔案有 import bug（見 mcp_server_v2.py 的說明），一律改指向修正後的版本。
 server_params = StdioServerParameters(command="python", args=["mcp_server.py"])
 
 BERTSCORE_SAFE_LENGTH = 200
+
+# 【點5、6新增】迭代閉環的最大重試次數，對應 ADK LoopAgent 的 max_iterations 概念。
+MAX_ITERATIONS = 2
+
+# 驗證用結構化區塊必須包含的欄位，會跟 MCP 工具實際回傳的資料逐一比對。
+VERIFICATION_FIELDS = ["incident_id", "camera_id", "event_type", "severity", "risk_level", "timestamp"]
+
+VERIFICATION_LOG_PATH = os.path.join(REPORT_DIR, "verification_log.jsonl")
 
 REFERENCE_REPORTS = {
     "fire": (
@@ -49,19 +61,12 @@ REFERENCE_REPORTS = {
 
 _report_lock = threading.Lock()
 
-# ==============================================================================
-# 【BERTScore 根本修正】
-# 真正病灶：hfl/chinese-roberta-wwm-ext 的 tokenizer 設定沒有明確指定最大長度，
-# Hugging Face 會用一個代表「無上限」的超大整數頂替，這個數字傳進底層 enable_truncation
-# 時會直接溢位。use_fast_tokenizer=False 這個參數在目前版本沒有確實生效，
-# 所以改用更直接的做法：攔截 AutoTokenizer.from_pretrained 這個載入函式，
-# 载入完成後強制把 model_max_length 改成合理的 512，不管走哪條內部路徑都會
-# 先經過這層修正，徹底避開溢位問題。
-# ==============================================================================
 _tokenizer_patched = False
 
 
 def _ensure_tokenizer_patch():
+    """沿用 v3 已驗證有效的修正：強制把 tokenizer 的 model_max_length 改成 512，
+    避開 hfl/chinese-roberta-wwm-ext 預設值溢位導致的 OverflowError。"""
     global _tokenizer_patched
     if _tokenizer_patched:
         return
@@ -78,6 +83,62 @@ def _ensure_tokenizer_patch():
 
     transformers.AutoTokenizer.from_pretrained = classmethod(_patched_from_pretrained)
     _tokenizer_patched = True
+
+
+def _build_user_prompt():
+    """【點5核心】在原本的指令之外，明確要求 LLM 在報告最後附上一段結構化 JSON，
+    JSON 裡的每個欄位值必須跟它剛剛透過工具查到的原始資料完全一致、逐字複製，
+    不可以重新排版、四捨五入或憑印象改寫。這段 JSON 就是我們拿來驗證「工具結果
+    有沒有被忠實使用」的依據，而不是靠人工肉眼檢查報告內容像不像。"""
+    fields_hint = "、".join(VERIFICATION_FIELDS)
+    return (
+        "【工安事件通報】後台狀態機已觸發告警，請你【必須】立刻調用 "
+        "`get_latest_incident_log` 工具取得最新事件的結構化資料，"
+        "不允許自行猜測。取得資料後：\n"
+        "1. 生成一份專業的中文事故初報，內容需包含：事件摘要、歸因判定、"
+        "風險等級、建議處置、追蹤建議。\n"
+        "2. 在報告最後，另起一段，附上一個 ```json 區塊```，"
+        f"格式為包含以下欄位的 JSON 物件：{fields_hint}。"
+        "這段 JSON 裡的每一個值，必須跟你剛剛從工具取得的原始資料完全一致、"
+        "逐字複製，不可以自行改寫格式、翻譯、四捨五入或憑印象填寫。"
+    )
+
+
+def _parse_verification_block(text: str):
+    """從 LLM 輸出中擷取 ```json ... ``` 區塊並解析成 dict，失敗回傳 None。"""
+    match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def _strip_verification_block(text: str) -> str:
+    """把驗證用 JSON 區塊從正文移除，避免污染 BERTScore 的語意評分
+    （JSON 格式的文字跟中文敘述报告放在一起比對語意相似度沒有意義）。"""
+    return re.sub(r"```json\s*\{.*?\}\s*```", "", text, flags=re.DOTALL).strip()
+
+
+def _verify_fields(llm_json, ground_truth: dict):
+    """逐欄位比對 LLM 自報的 JSON 跟系統實際查到的資料庫原始值是否一致。
+    回傳 (是否全部通過, 不符欄位清單)。"""
+    if llm_json is None:
+        return False, ["未偵測到驗證用JSON區塊，無法確認是否忠實使用工具結果"]
+
+    mismatches = []
+    for field in VERIFICATION_FIELDS:
+        gt_val = str(ground_truth.get(field, "")).strip()
+        llm_val = str(llm_json.get(field, "")).strip()
+        if gt_val != llm_val:
+            mismatches.append(f"{field}：資料庫實際值為「{gt_val}」，但你回報為「{llm_val}」")
+    return len(mismatches) == 0, mismatches
+
+
+def _append_verification_log(record: dict):
+    with open(VERIFICATION_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 async def _generate_report_async(incident_id: int, event_type: str):
@@ -97,18 +158,13 @@ async def _generate_report_async(incident_id: int, event_type: str):
                 for t in tools_response.tools
             ]
 
-            messages = [{
-                "role": "user",
-                "content": (
-                    "【工安事件通報】後台狀態機已觸發告警，請你【必須】立刻調用 "
-                    "`get_latest_incident_log` 工具取得最新事件的結構化資料，"
-                    "不允許自行猜測，取得資料後生成一份專業的中文事故初報，"
-                    "內容需包含：事件摘要、歸因判定、風險等級、建議處置、追蹤建議。"
-                ),
-            }]
-
+            messages = [{"role": "user", "content": _build_user_prompt()}]
+            ground_truth = None
             full_text = ""
+            iteration_records = []
+
             async with httpx.AsyncClient() as client:
+                # 第一次呼叫：要求模型決定是否調用工具
                 response = await client.post(
                     OLLAMA_URL_CHAT,
                     json={
@@ -128,41 +184,90 @@ async def _generate_report_async(incident_id: int, event_type: str):
                             server_result = await session.call_tool(
                                 "get_latest_incident_log", arguments={}
                             )
+                            tool_text = server_result.content[0].text
+                            try:
+                                ground_truth = json.loads(tool_text)
+                            except json.JSONDecodeError:
+                                ground_truth = None
                             messages.append(message)
                             messages.append({
                                 "role": "tool",
-                                "content": server_result.content[0].text,
+                                "content": tool_text,
                                 "name": "get_latest_incident_log",
                             })
-                            final_response = await client.post(
-                                OLLAMA_URL_CHAT,
-                                json={
-                                    "model": MODEL_NAME,
-                                    "messages": messages,
-                                    "options": {"temperature": 0.0},
-                                    "stream": False,
-                                },
-                                timeout=60.0,
-                            )
-                            full_text = (
-                                final_response.json().get("message", {}).get("content", "")
-                            )
                 else:
+                    # 模型完全沒有呼叫工具，直接視為驗證失敗（點5要驗證的正是這種情況）
                     full_text = message.get("content", "")
+
+                # 【點6核心】驗證-重試迴圈：exit_condition 為「所有關鍵欄位比對通過」
+                for iteration in range(1, MAX_ITERATIONS + 1):
+                    if ground_truth is None and iteration == 1 and full_text:
+                        # 第一輪就沒呼叫工具，記錄失敗但仍照原文往下走一次重試
+                        is_valid, mismatches = False, ["模型未呼叫 get_latest_incident_log 工具"]
+                    else:
+                        final_response = await client.post(
+                            OLLAMA_URL_CHAT,
+                            json={
+                                "model": MODEL_NAME,
+                                "messages": messages,
+                                "options": {"temperature": 0.0},
+                                "stream": False,
+                            },
+                            timeout=60.0,
+                        )
+                        full_text = final_response.json().get("message", {}).get("content", "")
+                        llm_json = _parse_verification_block(full_text)
+                        is_valid, mismatches = _verify_fields(llm_json, ground_truth or {})
+
+                    iteration_records.append({
+                        "iteration": iteration,
+                        "is_valid": is_valid,
+                        "mismatches": mismatches,
+                    })
+
+                    if is_valid:
+                        break
+
+                    if iteration < MAX_ITERATIONS:
+                        correction_msg = (
+                            "你上一次的回答有欄位與實際工具查詢結果不符，請根據以下差異"
+                            "重新產生完整報告（包含敘述文字與結尾的 json 驗證區塊）：\n"
+                            + "\n".join(mismatches)
+                        )
+                        messages.append({"role": "assistant", "content": full_text})
+                        messages.append({"role": "user", "content": correction_msg})
+
+    final_valid = iteration_records[-1]["is_valid"] if iteration_records else False
+    _append_verification_log({
+        "incident_id": incident_id,
+        "event_type": event_type,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "iterations_used": len(iteration_records),
+        "final_valid": final_valid,
+        "history": iteration_records,
+    })
+
+    narrative_text = _strip_verification_block(full_text)
 
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = os.path.join(REPORT_DIR, f"report_{incident_id}_{timestamp_str}.md")
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(f"# 🚨 事故歸因初報（事件 #{incident_id}）\n\n{full_text}")
+        f.write(f"# 🚨 事故歸因初報（事件 #{incident_id}）\n\n{narrative_text}")
+        f.write(f"\n\n---\n**[系統驗證紀錄]** 經過 {len(iteration_records)} 輪，"
+                 f"最終欄位驗證結果：{'通過 ✅' if final_valid else '未完全通過 ⚠️'}")
 
     print(f"\n📄 [報告生成完成] 已存至: {report_path}")
+    print(f"🔍 [工具忠實度驗證] 共 {len(iteration_records)} 輪，"
+          f"最終結果：{'通過' if final_valid else '未通過'}")
+    if not final_valid and iteration_records:
+        print(f"   最後一輪不符欄位：{iteration_records[-1]['mismatches']}")
 
     reference_text = REFERENCE_REPORTS.get(event_type)
-    if reference_text and full_text.strip():
+    if reference_text and narrative_text.strip():
         try:
             _ensure_tokenizer_patch()
             from bert_score import score
-            safe_candidate = full_text[:BERTSCORE_SAFE_LENGTH]
+            safe_candidate = narrative_text[:BERTSCORE_SAFE_LENGTH]
             safe_reference = reference_text[:BERTSCORE_SAFE_LENGTH]
             P, R, F1 = score(
                 [safe_candidate],
@@ -180,12 +285,11 @@ async def _generate_report_async(incident_id: int, event_type: str):
             )
             print(
                 f"   （註：評分僅取報告前 {BERTSCORE_SAFE_LENGTH} 字元，"
-                "受套件長文本限制所致，通常涵蓋事件摘要與歸因判定部分）"
+                "且已排除結尾的驗證用JSON區塊，只評分敘述正文）"
             )
         except Exception as e:
             import traceback
             print(f"⚠️ [BERTScore 評分失敗]: {e}")
-            print("完整錯誤追蹤（若問題持續，請把以下內容整段貼給我排查）：")
             traceback.print_exc()
     else:
         print(f"⚠️ 事件類型「{event_type}」尚無對應的參考報告，略過 BERTScore 評分。")
