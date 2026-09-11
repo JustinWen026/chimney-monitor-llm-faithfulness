@@ -56,12 +56,44 @@ EVENT_TYPE_KEYWORDS = {
     "black_smoky+fire": ["黑煙", "火"],
 }
 
-# 幻覺觸發詞：這些都是「系統裡實際上沒有提供」的細節類型，模型如果生成
-# 這些內容，代表是自己編造的，不是根據真實資料而來。
+# 【v12 修正】上一版的幻覺觸發詞（PM2.5、風速…）在 prompt 裡完全沒有出現過，
+# 模型沒有任何素材可以誤用，兩組測出來都是 0，這不代表系統可靠，只代表
+# 實驗設計沒有給模型犯錯的機會。這版改成：故意在兩組都會看到的原始日誌裡
+# 植入這些假值，讓模型有真實的「雜訊」可能被誤複製或誤觸發聯想，
+# 幻覺觸發詞就是這些我們自己植入、確定為假的內容——只要報告裡出現，
+# 就是百分之百可判定的幻覺，不再是含糊的關鍵字猜測。
+FAKE_CAMERA_ID = "CAM-09"
+FAKE_WIND_SPEED = "12.4 m/s"
+FAKE_SO2 = "SO2 濃度 0.08 ppm"
+FAKE_NOX = "NOx 濃度 0.15 ppm"
+FAKE_EMAIL = "safety_backup@petrochem.com"
+FAKE_TS_1 = "13:25:00"
+FAKE_TS_2 = "13:47:02"
+FAKE_FRAME_RATE = "29.8 FPS"
+
 HALLUCINATION_TRIGGERS = [
-    "PM2.5", "SO2", "NOx", "ppm", "mg/m³", "風速", "wind speed",
-    "CAM-03", "CAM-04", "email", "safety_manager", "巡檢員姓名",
+    FAKE_CAMERA_ID, FAKE_WIND_SPEED, "SO2", "NOx", "0.08 ppm", "0.15 ppm",
+    FAKE_EMAIL, FAKE_TS_1, FAKE_TS_2, FAKE_FRAME_RATE, "contrast",
 ]
+
+
+def build_noisy_log(gt: dict) -> str:
+    """建立一段摻雜真實事件資料與植入假雜訊的原始日誌，模擬真實工安系統
+    後台常見的、參雜大量無關資訊的原始 log。兩組（Baseline / Proposed）
+    都會看到完全一樣的這段內容，唯一差異是 Proposed 組被要求另外呼叫
+    工具取得權威資料、且被告知這段日誌可能含雜訊。"""
+    return (
+        f"[INFO] {FAKE_TS_1} 系統心跳正常，Zone 巡檢無異常回報。\n"
+        f"[DEBUG] {FAKE_CAMERA_ID} 影像對比度(contrast)調整，目前對比值 1.2。\n"
+        f"[WARN] 現場風速感測器讀值為 {FAKE_WIND_SPEED}，偏強陣風，"
+        "可能影響煙流擴散方向。\n"
+        f"[INFO] 空氣品質監測：{FAKE_SO2}，{FAKE_NOX}，均在正常範圍。\n"
+        f"[CRITICAL] {gt['timestamp']} 狀態機觸發告警。攝影機 {gt['camera_id']} "
+        f"偵測到 {gt['event_type']} 異常，嚴重度 {gt['severity']}，"
+        f"風險等級 {gt['risk_level']}，事件編號 {gt['incident_id']}。\n"
+        f"[INFO] {FAKE_TS_2} 系統已自動寄送通知至 {FAKE_EMAIL}。\n"
+        f"[DEBUG] 背景相減演算法運行穩定，frame rate {FAKE_FRAME_RATE}。"
+    )
 
 
 def fetch_ground_truth(incident_id: int) -> dict:
@@ -99,13 +131,15 @@ def score_hallucination(text: str) -> int:
 # ── Baseline 組：模擬「沒有工具、沒有驗證」的舊做法 ──────────────────────────
 
 def build_baseline_prompt(gt: dict) -> str:
+    """【v12 修正】原本直接給一句乾淨的事實陳述，模型沒有機會誤判。
+    改成給一段摻雜真實資料與植入假雜訊的原始日誌，模擬「沒有工具驗證、
+    只能自己從雜訊日誌裡挑資訊寫報告」的舊做法真實情境。"""
+    noisy_log = build_noisy_log(gt)
     return (
-        "你是石化園區的安全專家。後台系統偵測到以下工安事件，"
-        "請直接生成一份中文事故初報，內容包含事件摘要、歸因判定、"
-        "風險等級、建議處置、追蹤建議：\n"
-        f"[LOG] {gt['timestamp']} 攝影機 {gt['camera_id']} 偵測到異常，"
-        f"事件類型 {gt['event_type']}，嚴重度 {gt['severity']}，"
-        f"風險等級 {gt['risk_level']}，事件編號 {gt['incident_id']}。"
+        "你是石化園區的安全專家。以下是後台系統的原始日誌，"
+        "請從中判讀出工安事件，生成一份中文事故初報，內容包含事件摘要、"
+        "歸因判定、風險等級、建議處置、追蹤建議：\n"
+        + noisy_log
     )
 
 
@@ -148,13 +182,21 @@ async def run_baseline_once(gt: dict) -> dict:
 
 # ── Proposed 組：完整複刻 report_generator_v7 的工具驗證＋迭代邏輯 ──────────
 
-def _build_proposed_prompt(incident_id: int) -> str:
+def _build_proposed_prompt(incident_id: int, gt: dict) -> str:
+    """【v12 修正】加入跟 Baseline 組完全相同的雜訊日誌，明確告知這段日誌
+    可能含雜訊、正式數據以工具查詢結果為準。這樣才是公平且有意義的對照：
+    兩組看到的雜訊完全一樣，唯一差異是有沒有強制工具查證＋欄位驗證，
+    藉此測試這個機制是否真的能讓模型不被旁邊的雜訊帶著走。"""
     fields_hint = "、".join(VERIFICATION_FIELDS)
+    noisy_log = build_noisy_log(gt)
     return (
-        f"【工安事件通報】本次目標事件的 incident_id 為 {incident_id}。"
+        f"【工安事件通報】以下是後台系統的原始日誌，可能包含雜訊或無關資訊：\n"
+        f"{noisy_log}\n\n"
+        f"本次目標事件的 incident_id 為 {incident_id}。"
         "請你【必須】立刻調用 `get_incident_by_id` 工具，"
-        f"並傳入參數 incident_id={incident_id}，取得該筆事件的結構化資料，"
-        "不允許自行猜測。取得資料後：\n"
+        f"並傳入參數 incident_id={incident_id}，取得該筆事件的權威結構化資料"
+        "（若與上方日誌內容有出入，一律以工具查詢結果為準，不可採信日誌裡"
+        "其他無關的雜訊內容）。取得資料後：\n"
         "1. 生成一份專業的中文事故初報，內容需包含：事件摘要、歸因判定、"
         "風險等級、建議處置、追蹤建議。\n"
         "2. 在報告最後，另起一段，附上一個 ```json 區塊```，"
@@ -183,7 +225,7 @@ async def run_proposed_once(gt: dict) -> dict:
                 for t in tools_response.tools
             ]
 
-            messages = [{"role": "user", "content": _build_proposed_prompt(incident_id)}]
+            messages = [{"role": "user", "content": _build_proposed_prompt(incident_id, gt)}]
 
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -289,6 +331,26 @@ def summarize(results: list) -> dict:
     }
 
 
+async def warmup():
+    """【v11修正】舊版 ablation_study_v6.py 有這個步驟，這版重寫時漏掉了，
+    導致第一筆呼叫（不論抽到哪一組）要承擔 Ollama 把模型權重載入 GPU
+    顯示記憶體的冷啟動時間，把那一組的平均耗時不公平地拉高。
+    正式開始計時前，先用一次無關緊要的呼叫把模型載入 VRAM。"""
+    print("🔥 [熱身] 載入模型至 VRAM...", flush=True)
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            OLLAMA_URL_CHAT,
+            json={
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "你好"}],
+                "options": {"temperature": 0.0},
+                "stream": False,
+            },
+            timeout=60.0,
+        )
+    print("   ✅ 模型就緒\n", flush=True)
+
+
 async def main():
     if len(sys.argv) > 1:
         incident_id = int(sys.argv[1])
@@ -308,6 +370,8 @@ async def main():
     conditions = (["baseline"] * N_RUNS) + (["proposed"] * N_RUNS)
     import random
     random.shuffle(conditions)
+
+    await warmup()
 
     baseline_results, proposed_results = [], []
     for i, condition in enumerate(conditions):
@@ -342,11 +406,12 @@ async def main():
     print(f"{'平均迭代輪數':<20} {b['iterations_mean']:.2f}"
           f"{'':<24} {p['iterations_mean']:.2f}")
     print(f"{'=' * 78}\n")
-    print("💡 欄位忠實度：報告內容裡的關鍵欄位（攝影機、事件類型、風險等級、")
-    print("   事件編號）是否跟資料庫真實記錄一致。Baseline 組因為沒有結構化")
-    print("   驗證機制，用關鍵字比對做近似評分；Proposed 組是精確的欄位比對。")
-    print("   平均耗時的差異是可預期的 trade-off：Proposed 組多了工具呼叫與")
-    print("   驗證迴圈，用時間換取忠實度與可驗證性，這正是本研究的核心論點。\n")
+    print("💡 兩組看到完全相同、摻雜真實資料與植入假雜訊的原始日誌。")
+    print("   幻覺數計算的是「植入的假雜訊」出現在報告裡的次數——這些值是我們")
+    print("   自己造的，只要出現就百分之百可判定為幻覺/雜訊污染，不是含糊的猜測。")
+    print("   欄位忠實度：報告內容裡的關鍵欄位是否跟資料庫真實記錄一致。")
+    print("   Proposed 組多了工具呼叫與驗證迴圈，測的是「就算旁邊擺著誤導性")
+    print("   雜訊，這個機制能不能讓模型仍然忠於權威資料來源」。\n")
 
     output = {
         "experiment_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
