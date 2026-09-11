@@ -1,0 +1,185 @@
+{
+  "experiment_date": "2026-09-11 08:44:24",
+  "model": "qwen2.5:7b-instruct",
+  "n_runs_each": 10,
+  "ground_truth_incident": {
+    "incident_id": 55,
+    "timestamp": "2026-09-11 08:20:50",
+    "camera_id": "CAM-02",
+    "event_type": "white_smoky",
+    "severity": "WARNING",
+    "risk_level": 2
+  },
+  "baseline_summary": {
+    "grounding_mean": 0.85,
+    "grounding_std": 0.12909944487358055,
+    "hallucination_mean": 3,
+    "hallucination_std": 0.816496580927726,
+    "elapsed_mean": 8.030188417434692,
+    "elapsed_std": 0.7716871508477302,
+    "iterations_mean": 1
+  },
+  "proposed_summary": {
+    "grounding_mean": 1.0,
+    "grounding_std": 0.0,
+    "hallucination_mean": 3.6,
+    "hallucination_std": 2.0110804171997807,
+    "elapsed_mean": 8.24076886177063,
+    "elapsed_std": 0.5956313933950608,
+    "iterations_mean": 1
+  },
+  "raw_baseline": [
+    {
+      "condition": "baseline",
+      "elapsed": 7.955498695373535,
+      "grounding_score": 0.75,
+      "hallucination_count": 4,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 7.806518793106079,
+      "grounding_score": 0.75,
+      "hallucination_count": 4,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 9.450677394866943,
+      "grounding_score": 0.75,
+      "hallucination_count": 3,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 6.956972122192383,
+      "grounding_score": 0.75,
+      "hallucination_count": 3,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 7.983166217803955,
+      "grounding_score": 1.0,
+      "hallucination_count": 2,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 8.557745695114136,
+      "grounding_score": 1.0,
+      "hallucination_count": 3,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 7.209508657455444,
+      "grounding_score": 1.0,
+      "hallucination_count": 3,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 8.576078414916992,
+      "grounding_score": 0.75,
+      "hallucination_count": 4,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 8.554724216461182,
+      "grounding_score": 0.75,
+      "hallucination_count": 2,
+      "iterations_used": 1
+    },
+    {
+      "condition": "baseline",
+      "elapsed": 7.250993967056274,
+      "grounding_score": 1.0,
+      "hallucination_count": 2,
+      "iterations_used": 1
+    }
+  ],
+  "raw_proposed": [
+    {
+      "condition": "proposed",
+      "elapsed": 8.249980926513672,
+      "grounding_score": 1.0,
+      "hallucination_count": 1,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 8.711965560913086,
+      "grounding_score": 1.0,
+      "hallucination_count": 5,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 8.370718479156494,
+      "grounding_score": 1.0,
+      "hallucination_count": 1,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 8.243154764175415,
+      "grounding_score": 1.0,
+      "hallucination_count": 2,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 7.593294858932495,
+      "grounding_score": 1.0,
+      "hallucination_count": 2,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 8.14140796661377,
+      "grounding_score": 1.0,
+      "hallucination_count": 3,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 7.370333194732666,
+      "grounding_score": 1.0,
+      "hallucination_count": 5,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 8.196587800979614,
+      "grounding_score": 1.0,
+      "hallucination_count": 6,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 9.54466986656189,
+      "grounding_score": 1.0,
+      "hallucination_count": 6,
+      "iterations_used": 1,
+      "tool_was_called": true
+    },
+    {
+      "condition": "proposed",
+      "elapsed": 7.985575199127197,
+      "grounding_score": 1.0,
+      "hallucination_count": 5,
+      "iterations_used": 1,
+      "tool_was_called": true
+    }
+  ]
+}
