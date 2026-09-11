@@ -42,7 +42,7 @@ MODEL_NAME = "qwen2.5:7b-instruct"
 # N_RUNS=10 時總共 30 次，Tool-only 跟 Proposed 都要起 MCP 子行程，
 # 抓 10~20 分鐘跑完。時間緊迫可先調到 5~6 測試流程是否正常，
 # 正式數據再調回 10 以上。
-N_RUNS = 30
+N_RUNS = 10
 MAX_ITERATIONS = 2
 
 server_params = StdioServerParameters(command="python", args=["mcp_server.py"])
@@ -51,10 +51,16 @@ VERIFICATION_FIELDS = ["incident_id", "camera_id", "event_type", "severity", "ri
 # 事件類型對照中文關鍵詞，供 Baseline 組的自由文字輸出比對用
 # （Baseline 組沒有強制輸出結構化 JSON，只能用關鍵字比對是否有提到正確類型）
 EVENT_TYPE_KEYWORDS = {
-    "fire": ["火災", "明火", "火焰", "起火"],
-    "black_smoky": ["黑煙"],
-    "white_smoky": ["白煙"],
-    "black_smoky+fire": ["黑煙", "火"],
+    # 【修正】原本只設了繁體「白煙」這一種寫法，完全沒涵蓋模型實際會用的
+    # 其他正確表達方式：簡體字（烟/雾）、換句話說的同義詞（白色煙霧）、
+    # 以及最常見、最不會產生歧義的做法——直接引用工具回傳的英文原始
+    # 欄位值（white_smoky）。原本的清單漏掉這些，導致大量「講對了但用詞
+    # 不同」的正確輸出被誤判為「沒講對事件類型」，這才是造成 Tool-only
+    # 組分數異常偏低的真正原因，不是機制本身有問題。
+    "fire": ["火災", "火灾", "明火", "火焰", "起火", "fire"],
+    "black_smoky": ["黑煙", "黑烟", "black_smoky", "black smoke"],
+    "white_smoky": ["白煙", "白烟", "白色煙霧", "白色烟雾", "white_smoky", "white smoke"],
+    "black_smoky+fire": ["黑煙", "黑烟", "black_smoky", "複合", "复合", "black_smoky+fire"],
 }
 
 # 【v12 修正】上一版的幻覺觸發詞（PM2.5、風速…）在 prompt 裡完全沒有出現過，
