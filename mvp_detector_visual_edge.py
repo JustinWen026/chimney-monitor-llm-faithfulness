@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from db_manager import log_incident
 from discord_notifier import send_discord_alert_async
-from report_generator import trigger_report_generation_async
+from report_generator import trigger_report_generation_async, get_pending_report_count
 from ultralytics import YOLO
 
 # ==============================================================================
@@ -52,12 +52,9 @@ DENSITY_MODERATE_THRESHOLD = 0.35
 
 print_lock = threading.Lock()
 
-# 【v7 修正】原本用 threading.enumerate() 掃描「所有存活執行緒」來判斷背景任務
-# 是否跑完，這個做法會被 huggingface_hub / torch 等第三方套件內部常駐、不會
-# 主動結束的執行緒池誤判，導致主程式跑完偵測後卡住不動，要手動 Ctrl+C 才能繼續。
-# 改成只追蹤「我們自己真正建立」的報告生成執行緒，只等這些跑完即可。
-report_threads = []
-report_threads_lock = threading.Lock()
+# 【v10 修正】report_generator_v7 已經改成佇列制，每個事件都保證會被排入
+# 佇列處理，不會再有「執行緒」需要個別追蹤，改成在結束時輪詢
+# get_pending_report_count() 判斷佇列是否清空即可，不再需要這個清單。
 
 # ------------------------------------------------------------------------------
 # 【多視窗顯示問題修正】
@@ -273,12 +270,9 @@ def process_camera_stream(camera_id, video_path, model):
                 f"💾 [SQL資料庫] 已新增工安紀錄 (ID: #{incident_id}, 狀態: PENDING)",
             )
 
-            new_report_thread = trigger_report_generation_async(
+            trigger_report_generation_async(
                 incident_id=incident_id, event_type=active_anomaly_type
             )
-            if new_report_thread is not None:
-              with report_threads_lock:
-                report_threads.append(new_report_thread)
 
             if (current_time - last_alert_time) > ALERT_COOLDOWN_SEC:
               readable_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -443,29 +437,30 @@ def main():
 
   print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [EXIT] 所有攝影機串流已結束。")
 
-  with report_threads_lock:
-    pending_threads = [t for t in report_threads if t.is_alive()]
-
-  if pending_threads:
+  pending_count = get_pending_report_count()
+  if pending_count > 0:
     print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 還有 {len(pending_threads)} "
-        "個報告生成任務仍在執行中，請稍候..."
+        f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 佇列中還有 {pending_count} "
+        "份報告待生成（含正在處理中的），請稍候..."
     )
-    # 逾時保護：每份報告含 LLM 生成 + BERTScore 評分，正常情況下不會超過幾分鐘，
-    # 給每個執行緒最多 180 秒，超過就不再等待，避免真的遇到異常卡死時無法結束程式。
-    for t in pending_threads:
-      t.join(timeout=180)
-    still_alive = [t for t in pending_threads if t.is_alive()]
-    if still_alive:
+    # 逾時保護：每份報告含 LLM 生成 + BERTScore 評分，正常情況下一份不會超過
+    # 幾分鐘，這裡給全部排隊的報告總共最多 10 分鐘處理時間，超過就不再等待，
+    # 避免真的遇到異常時無法結束程式（佇列制下事件不會消失，之後仍會繼續處理，
+    # 只是主程式不再阻塞在這裡等它）。
+    deadline = time.time() + 600
+    while get_pending_report_count() > 0 and time.time() < deadline:
+      time.sleep(1.0)
+    remaining = get_pending_report_count()
+    if remaining > 0:
       print(
-          f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ 有 {len(still_alive)} "
-          "個報告生成任務逾時仍未結束，已不再等待（可能是 LLM 或 BERTScore 端異常，"
-          "建議之後檢查 reports/verification_log.jsonl 確認該筆是否有正常寫入）。"
+          f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️ 仍有 {remaining} 份報告"
+          "尚未處理完成，已停止等待（背景工作執行緒仍會繼續處理，只是主程式"
+          "不再阻塞；建議稍後檢查 reports/verification_log.jsonl 確認完整性）。"
       )
     else:
       print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 所有報告生成任務已完成。")
   else:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 沒有仍在執行中的報告生成任務。")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ 沒有仍在等待處理的報告。")
 
 
 if __name__ == "__main__":

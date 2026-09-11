@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import queue
 import re
 import threading
 from datetime import datetime
@@ -54,8 +55,36 @@ REFERENCE_REPORTS = {
     ),
 }
 
-_report_lock = threading.Lock()
+_report_queue = queue.Queue()
+_worker_thread = None
+_worker_start_lock = threading.Lock()
 _tokenizer_patched = False
+
+
+def _report_worker_loop():
+    """【v7 修正】原本用互斥鎖，撞到就直接放棄該次報告生成，資料庫裡明明有
+    這筆事件紀錄，卻永遠不會有對應的報告或驗證紀錄，而且完全不會留下任何
+    「這筆被跳過了」的痕跡，只會在終端機閃過一行訊息。改成單一背景工作
+    執行緒依序從佇列取出事件處理，每個事件都保證會被生成，差別只在於
+    等多久才輪到它，不會再有事件憑空消失。"""
+    while True:
+        incident_id, event_type = _report_queue.get()
+        try:
+            asyncio.run(_generate_report_async(incident_id, event_type))
+        except Exception as e:
+            import traceback
+            print(f"⚠️ [報告生成] 處理 incident_id={incident_id} 時發生未預期錯誤：{e}")
+            traceback.print_exc()
+        finally:
+            _report_queue.task_done()
+
+
+def _ensure_worker_started():
+    global _worker_thread
+    with _worker_start_lock:
+        if _worker_thread is None:
+            _worker_thread = threading.Thread(target=_report_worker_loop, daemon=True)
+            _worker_thread.start()
 
 
 def _ensure_tokenizer_patch():
@@ -256,16 +285,16 @@ async def _generate_report_async(incident_id: int, event_type: str):
             safe_candidate = narrative_text[:BERTSCORE_SAFE_LENGTH]
             safe_reference = reference_text[:BERTSCORE_SAFE_LENGTH]
 
-            # 【v6 修正】原始 BERTScore 有已知的「地板效應」：即使兩段語意完全
-            # 無關的中文句子，Cosine similarity 在 BERT 詞向量空間裡也普遍偏高，
-            # 導致分數天生就會落在偏高區間、鑑別力不足。rescale_with_baseline
-            # 會扣掉這個系統性偏差，讓分數更能反映「真正的語意差異」。
-            # 但這個 baseline 檔案是依 model_type + lang + num_layers 這組合
-            # 預先算好放在套件內建清單裡的，hfl/chinese-roberta-wwm-ext 不一定
-            # 在清單內，所以這裡用 try/except 包起來：校準版本抓不到 baseline
-            # 檔案時，直接印出原因並退回未校準分數，不讓整個報告生成流程失敗。
-            rescaled_P = rescaled_R = rescaled_F1 = None
-            try:
+            # 【v7 修正】上一版發現：套件在找不到 baseline 檔案時，不會丟出例外，
+            # 只會印一個 UserWarning，然後直接跳過校準、悄悄回傳跟原始分數
+            # 完全相同的數字。原本用 try/except 的判斷方式完全攔不到這種情況，
+            # 會誤導成「已校準」但其實數值根本沒變。這裡改用 warnings 模組主動
+            # 攔截這個警告文字，只要偵測到「Baseline not Found」，就明確標示
+            # 校準不可用，而不是誤植一組看似校準過、實際上原封不動的數字。
+            import warnings
+            baseline_missing = False
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                warnings.simplefilter("always")
                 rP, rR, rF1 = score(
                     [safe_candidate],
                     [safe_reference],
@@ -277,12 +306,9 @@ async def _generate_report_async(incident_id: int, event_type: str):
                     batch_size=1,
                     rescale_with_baseline=True,
                 )
-                rescaled_P, rescaled_R, rescaled_F1 = rP.item(), rR.item(), rF1.item()
-            except Exception as rescale_error:
-                print(
-                    "ℹ️ [BERTScore] 此模型/語言組合沒有對應的 baseline 校準檔案，"
-                    f"退回未校準分數（原因：{rescale_error}）"
-                )
+                for w in caught_warnings:
+                    if "Baseline not Found" in str(w.message):
+                        baseline_missing = True
 
             P, R, F1 = score(
                 [safe_candidate],
@@ -298,10 +324,16 @@ async def _generate_report_async(incident_id: int, event_type: str):
                 f"📊 [BERTScore 原始分數] Precision={P.item():.4f}  "
                 f"Recall={R.item():.4f}  F1={F1.item():.4f}"
             )
-            if rescaled_F1 is not None:
+            if baseline_missing:
                 print(
-                    f"📊 [BERTScore 校準後分數] Precision={rescaled_P:.4f}  "
-                    f"Recall={rescaled_R:.4f}  F1={rescaled_F1:.4f}"
+                    "ℹ️ [BERTScore 校準] hfl/chinese-roberta-wwm-ext 沒有對應的"
+                    " baseline 校準檔案，套件已自動跳過校準，"
+                    "以上僅為未校準的原始分數。"
+                )
+            else:
+                print(
+                    f"📊 [BERTScore 校準後分數] Precision={rP.item():.4f}  "
+                    f"Recall={rR.item():.4f}  F1={rF1.item():.4f}"
                 )
                 print(
                     "   （校準後分數扣掉了 BERT 詞向量空間的系統性偏差，"
@@ -320,23 +352,21 @@ async def _generate_report_async(incident_id: int, event_type: str):
 
 
 def trigger_report_generation_async(incident_id: int, event_type: str):
-    """【v5 修正】回傳建立的 Thread 物件（或 None），讓呼叫端可以自己追蹤、
-    join 這個特定的執行緒，不要再靠掃描 threading.enumerate() 判斷「背景任務
-    是否全部結束」——那樣容易被 huggingface_hub / torch 等第三方套件自己內部
-    常駐的執行緒池誤判為「還沒結束」，導致主程式看起來卡住不動。"""
-    if not _report_lock.acquire(blocking=False):
-        print("\n⚠️ [報告生成] 上一份報告仍在生成中，跳過本次觸發。")
-        return None
+    """把報告生成請求放進佇列，交給單一背景工作執行緒依序處理。
+    這個函式本身會立刻返回、不會阻塞偵測迴圈；跟舊版最大差異是
+    「不會再有事件因為撞到別的事件正在生成而被直接丟棄」。"""
+    _ensure_worker_started()
+    _report_queue.put((incident_id, event_type))
+    print(
+        f"\n📥 [報告佇列] incident_id={incident_id} 已排入報告生成佇列"
+        f"（佇列中尚有 {_report_queue.unfinished_tasks} 筆待處理，含本筆）。"
+    )
 
-    def run():
-        try:
-            asyncio.run(_generate_report_async(incident_id, event_type))
-        finally:
-            _report_lock.release()
 
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    return thread
+def get_pending_report_count() -> int:
+    """回傳目前佇列中「還沒處理完」的報告數量（包含正在處理中的那一筆），
+    供偵測端在結束時輪詢，判斷是否所有報告都已生成完畢。"""
+    return _report_queue.unfinished_tasks
 
 
 if __name__ == "__main__":
