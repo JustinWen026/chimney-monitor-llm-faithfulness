@@ -38,10 +38,11 @@ from db_manager import DB_PATH
 OLLAMA_URL_CHAT = "http://localhost:11434/api/chat"
 MODEL_NAME = "qwen2.5:7b-instruct"
 
-# 兩組各跑幾次。原本 v6 用 N=30，這裡先保守設 N=10（Proposed 組每次都要
-# 起一個 MCP 子行程 + 最多兩輪 LLM 呼叫，比舊版單純一次 generate 慢很多），
-# 兩組共 20 次，跑完大概抓幾分鐘到十幾分鐘，時間允許再自行調高。
-N_RUNS = 10
+# 現在是三組（Baseline / Tool-only / Proposed）各跑 N_RUNS 次，共 3×N_RUNS 次。
+# N_RUNS=10 時總共 30 次，Tool-only 跟 Proposed 都要起 MCP 子行程，
+# 抓 10~20 分鐘跑完。時間緊迫可先調到 5~6 測試流程是否正常，
+# 正式數據再調回 10 以上。
+N_RUNS = 30
 MAX_ITERATIONS = 2
 
 server_params = StdioServerParameters(command="python", args=["mcp_server.py"])
@@ -176,7 +177,9 @@ async def run_baseline_once(gt: dict) -> dict:
         "elapsed": elapsed,
         "grounding_score": score_grounding_baseline(text, gt),
         "hallucination_count": score_hallucination(text),
+        "hallucination_keywords_hit": [kw for kw in HALLUCINATION_TRIGGERS if kw.lower() in text.lower()],
         "iterations_used": 1,
+        "output_text": text,
     }
 
 
@@ -306,8 +309,105 @@ async def run_proposed_once(gt: dict) -> dict:
         "elapsed": elapsed,
         "grounding_score": 1.0 if final_valid else 0.0,
         "hallucination_count": score_hallucination(narrative_text),
+        "hallucination_keywords_hit": [kw for kw in HALLUCINATION_TRIGGERS if kw.lower() in narrative_text.lower()],
         "iterations_used": len(iteration_valid_flags),
         "tool_was_called": tool_was_called,
+        "output_text": narrative_text,
+    }
+
+
+def _build_tool_only_prompt(incident_id: int, gt: dict) -> str:
+    """【v12 三組消融新增】中間組：一樣看得到雜訊日誌、一樣被要求呼叫工具
+    取得權威資料，但不要求輸出驗證用 JSON、不做欄位比對、不重試。
+    用來拆解「單純擁有工具查證的資料」跟「工具+強制驗證+迭代重試」
+    這兩件事，各自對忠實度與幻覺率的貢獻有多少——這才是消融實驗該回答
+    的問題：不是『有沒有全部機制』，是『拿掉驗證+重試這一層，還剩多少效果』。"""
+    noisy_log = build_noisy_log(gt)
+    return (
+        f"【工安事件通報】以下是後台系統的原始日誌，可能包含雜訊或無關資訊：\n"
+        f"{noisy_log}\n\n"
+        f"本次目標事件的 incident_id 為 {incident_id}。"
+        "請你呼叫 `get_incident_by_id` 工具取得該筆事件的權威結構化資料"
+        "（若與上方日誌內容有出入，一律以工具查詢結果為準，不可採信日誌裡"
+        "其他無關的雜訊內容），並生成一份中文事故初報，內容包含事件摘要、"
+        "歸因判定、風險等級、建議處置、追蹤建議。"
+    )
+
+
+async def run_tool_only_once(gt: dict) -> dict:
+    """中間組：呼叫一次工具、不驗證、不重試，單次生成即結束。"""
+    incident_id = gt["incident_id"]
+    start = time.time()
+    tool_was_called = False
+    full_text = ""
+
+    async with stdio_client(server_params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            tools_response = await session.list_tools()
+            available_tools = [
+                {
+                    "type": "function",
+                    "function": {"name": t.name, "description": t.description, "parameters": t.inputSchema},
+                }
+                for t in tools_response.tools
+            ]
+            messages = [{"role": "user", "content": _build_tool_only_prompt(incident_id, gt)}]
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    OLLAMA_URL_CHAT,
+                    json={
+                        "model": MODEL_NAME,
+                        "messages": messages,
+                        "tools": available_tools,
+                        "options": {"temperature": 0.3},
+                        "stream": False,
+                    },
+                    timeout=60.0,
+                )
+                message = response.json().get("message", {})
+
+                if message.get("tool_calls"):
+                    for tool_call in message["tool_calls"]:
+                        if tool_call["function"]["name"] == "get_incident_by_id":
+                            tool_was_called = True
+                            server_result = await session.call_tool(
+                                "get_incident_by_id", arguments={"incident_id": incident_id}
+                            )
+                            tool_text = server_result.content[0].text
+                            messages.append(message)
+                            messages.append({
+                                "role": "tool",
+                                "content": tool_text,
+                                "name": "get_incident_by_id",
+                            })
+
+                # 不驗證、不重試：不管有沒有呼叫工具，都只生成這一次就結束。
+                final_response = await client.post(
+                    OLLAMA_URL_CHAT,
+                    json={
+                        "model": MODEL_NAME,
+                        "messages": messages,
+                        "options": {"temperature": 0.3},
+                        "stream": False,
+                    },
+                    timeout=60.0,
+                )
+                full_text = final_response.json().get("message", {}).get("content", "")
+
+    elapsed = time.time() - start
+    return {
+        "condition": "tool_only",
+        "elapsed": elapsed,
+        # 這組沒有強制輸出結構化 JSON，用跟 Baseline 相同的關鍵字比對法評分，
+        # 確保跟 Baseline 用同一把尺，才能公平看出「有工具」本身的貢獻。
+        "grounding_score": score_grounding_baseline(full_text, gt),
+        "hallucination_count": score_hallucination(full_text),
+        "hallucination_keywords_hit": [kw for kw in HALLUCINATION_TRIGGERS if kw.lower() in full_text.lower()],
+        "iterations_used": 1,
+        "tool_was_called": tool_was_called,
+        "output_text": full_text,
     }
 
 
@@ -361,69 +461,101 @@ async def main():
     gt = fetch_ground_truth(incident_id)
 
     print(f"\n{'=' * 70}")
-    print(f"   消融實驗 v10 — 工具驗證 + 迭代閉環對報告忠實度的影響")
+    print(f"   消融實驗 v12 — 拆解「工具查證」與「驗證+迭代重試」各自的貢獻")
     print(f"   Ground Truth 事件：#{gt['incident_id']}  {gt['camera_id']}  "
           f"{gt['event_type']}  風險等級{gt['risk_level']}")
-    print(f"   模型: {MODEL_NAME}  |  每組 N={N_RUNS}，隨機順序")
+    print(f"   模型: {MODEL_NAME}  |  每組 N={N_RUNS}，隨機順序，共 {N_RUNS * 3} 次")
     print(f"{'=' * 70}")
 
-    conditions = (["baseline"] * N_RUNS) + (["proposed"] * N_RUNS)
+    # 【v12 三組消融】原本只比較「全有」vs「全無」，只能回答「整套機制有沒有用」，
+    # 回答不了「到底是工具本身有用，還是驗證+重試這個機制本身有用」。
+    # 加入 tool_only 中間組，才是名符其實的『消融』：逐步拿掉元件，看各自貢獻。
+    conditions = (["baseline"] * N_RUNS) + (["tool_only"] * N_RUNS) + (["proposed"] * N_RUNS)
     import random
     random.shuffle(conditions)
 
     await warmup()
 
-    baseline_results, proposed_results = [], []
+    condition_labels = {
+        "baseline": "Baseline（無工具/無驗證）",
+        "tool_only": "Tool-only（有工具/無驗證重試）",
+        "proposed": "Proposed（工具+驗證+迭代）",
+    }
+    condition_funcs = {
+        "baseline": run_baseline_once,
+        "tool_only": run_tool_only_once,
+        "proposed": run_proposed_once,
+    }
+
+    results_by_condition = {"baseline": [], "tool_only": [], "proposed": []}
     for i, condition in enumerate(conditions):
-        label = "Baseline（無工具/無驗證）" if condition == "baseline" else "Proposed（工具+驗證+迭代）"
-        print(f"▶ Run {i + 1:02d}/{len(conditions)} [{label}]", flush=True)
-        if condition == "baseline":
-            r = await run_baseline_once(gt)
-            baseline_results.append(r)
-        else:
-            r = await run_proposed_once(gt)
-            proposed_results.append(r)
+        print(f"▶ Run {i + 1:02d}/{len(conditions)} [{condition_labels[condition]}]", flush=True)
+        r = await condition_funcs[condition](gt)
+        results_by_condition[condition].append(r)
         print(
             f"   ✓ 時間={r['elapsed']:.2f}s | 忠實度={r['grounding_score']:.0%} | "
             f"幻覺數={r['hallucination_count']} | 迭代輪數={r['iterations_used']}"
         )
 
-    b = summarize(baseline_results)
-    p = summarize(proposed_results)
+    b = summarize(results_by_condition["baseline"])
+    t = summarize(results_by_condition["tool_only"])
+    p = summarize(results_by_condition["proposed"])
 
-    print(f"\n\n{'=' * 78}")
-    print(f"          消融實驗結果對比（N={N_RUNS} each）")
+    print(f"\n\n{'=' * 96}")
+    print(f"          消融實驗結果對比（N={N_RUNS} each，共 {N_RUNS * 3} 次）")
     print(f"          Ground Truth 事件：#{gt['incident_id']}（{gt['event_type']}）")
-    print(f"{'=' * 78}")
-    print(f"{'指標':<20} {'Baseline（無工具/無驗證）':<28} {'Proposed（工具+驗證+迭代）'}")
-    print("-" * 78)
-    print(f"{'★ 欄位忠實度':<20} {b['grounding_mean']:.1%}±{b['grounding_std']:.1%}"
-          f"{'':<15} {p['grounding_mean']:.1%}±{p['grounding_std']:.1%}")
-    print(f"{'★ 平均幻覺數':<20} {b['hallucination_mean']:.2f}±{b['hallucination_std']:.2f}"
-          f"{'':<18} {p['hallucination_mean']:.2f}±{p['hallucination_std']:.2f}")
-    print(f"{'平均耗時':<20} {b['elapsed_mean']:.2f}±{b['elapsed_std']:.2f} s"
-          f"{'':<15} {p['elapsed_mean']:.2f}±{p['elapsed_std']:.2f} s")
-    print(f"{'平均迭代輪數':<20} {b['iterations_mean']:.2f}"
-          f"{'':<24} {p['iterations_mean']:.2f}")
-    print(f"{'=' * 78}\n")
-    print("💡 兩組看到完全相同、摻雜真實資料與植入假雜訊的原始日誌。")
-    print("   幻覺數計算的是「植入的假雜訊」出現在報告裡的次數——這些值是我們")
-    print("   自己造的，只要出現就百分之百可判定為幻覺/雜訊污染，不是含糊的猜測。")
-    print("   欄位忠實度：報告內容裡的關鍵欄位是否跟資料庫真實記錄一致。")
-    print("   Proposed 組多了工具呼叫與驗證迴圈，測的是「就算旁邊擺著誤導性")
-    print("   雜訊，這個機制能不能讓模型仍然忠於權威資料來源」。\n")
+    print(f"{'=' * 96}")
+    print(f"{'指標':<18} {'Baseline':<20} {'Tool-only':<20} {'Proposed':<20}")
+    print(f"{'':<18} {'(無工具/無驗證)':<20} {'(有工具/無驗證重試)':<20} {'(工具+驗證+迭代)':<20}")
+    print("-" * 96)
+    print(f"{'★ 欄位忠實度':<18} {b['grounding_mean']:.1%}±{b['grounding_std']:.1%}"
+          f"{'':<10} {t['grounding_mean']:.1%}±{t['grounding_std']:.1%}"
+          f"{'':<10} {p['grounding_mean']:.1%}±{p['grounding_std']:.1%}")
+    print(f"{'★ 平均幻覺數':<18} {b['hallucination_mean']:.2f}±{b['hallucination_std']:.2f}"
+          f"{'':<13} {t['hallucination_mean']:.2f}±{t['hallucination_std']:.2f}"
+          f"{'':<13} {p['hallucination_mean']:.2f}±{p['hallucination_std']:.2f}")
+    print(f"{'平均耗時':<18} {b['elapsed_mean']:.2f}±{b['elapsed_std']:.2f} s"
+          f"{'':<10} {t['elapsed_mean']:.2f}±{t['elapsed_std']:.2f} s"
+          f"{'':<10} {p['elapsed_mean']:.2f}±{p['elapsed_std']:.2f} s")
+    print(f"{'平均迭代輪數':<18} {b['iterations_mean']:.2f}"
+          f"{'':<19} {t['iterations_mean']:.2f}"
+          f"{'':<19} {p['iterations_mean']:.2f}")
+    print(f"{'=' * 96}\n")
+    print("💡 三組看到完全相同、摻雜真實資料與植入假雜訊的原始日誌。")
+    print("   Tool-only 組拆解出「單純擁有工具查證資料」的貢獻；")
+    print("   Proposed 組在此之上再加上強制驗證＋迭代重試，兩者之差")
+    print("   才是『驗證+重試機制本身』的貢獻，而不是工具本身的貢獻。")
+    print("   幻覺數計算的是「植入的假雜訊」出現在報告裡的次數，這些值是")
+    print("   我們自己造的，只要出現就可判定為雜訊污染，但無法區分模型是")
+    print("   『誤把雜訊當事實』還是『正確提及並排除雜訊』——兩者都會被計入，")
+    print("   這是本量測法的已知限制，請務必人工抽查 output_text 欄位確認。\n")
+    print("⚠️  方法論範圍聲明：本測試為研究者自行設計之受控雜訊情境，用於")
+    print("   診斷『工具驗證＋迭代閉環』機制的相對效果，樣本為單一模型")
+    print("   （qwen2.5:7b-instruct）、單一事件類型、N=" + str(N_RUNS) + " 之小樣本結果，")
+    print("   不宣稱涵蓋真實世界所有幻覺樣態或可推論至其他模型/情境。\n")
 
     output = {
         "experiment_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "model": MODEL_NAME,
         "n_runs_each": N_RUNS,
         "ground_truth_incident": gt,
+        "methodology_scope_note": (
+            "本測試為研究者自行設計之受控雜訊情境（自行植入已知為假的雜訊內容，"
+            "非取自真實事故資料），用於診斷工具驗證與迭代重試機制的相對效果，"
+            "樣本為單一模型（qwen2.5:7b-instruct）、單一 ground truth 事件、"
+            f"每組 N={N_RUNS} 之小樣本結果。幻覺計數以關鍵字比對實作，"
+            "無法區分『誤採信雜訊為事實』與『正確提及並排除雜訊』兩種不同行為，"
+            "建議人工複核 output_text 欄位以確認自動化評分之有效性。"
+            "本結果不宣稱涵蓋真實世界所有幻覺樣態，亦不宣稱可推論至其他模型或情境。"
+        ),
         "baseline_summary": b,
+        "tool_only_summary": t,
         "proposed_summary": p,
-        "raw_baseline": baseline_results,
-        "raw_proposed": proposed_results,
+        "raw_baseline": results_by_condition["baseline"],
+        "raw_tool_only": results_by_condition["tool_only"],
+        "raw_proposed": results_by_condition["proposed"],
     }
-    out_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_v10.json"
+    out_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_v12.json"
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
@@ -431,7 +563,7 @@ async def main():
     except Exception:
         # 若不在 Windows 專案路徑下執行（例如先在其他環境測試語法），
         # 退回存在目前工作目錄，不讓實驗結果因路徑問題而遺失。
-        fallback_path = "ablation_results_v10.json"
+        fallback_path = "ablation_results_v12.json"
         with open(fallback_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
         print(f"📂 詳細數據已存至 {fallback_path}（預設路徑不可寫入，已退回目前目錄）\n")
