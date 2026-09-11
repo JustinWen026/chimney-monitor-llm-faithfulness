@@ -255,6 +255,35 @@ async def _generate_report_async(incident_id: int, event_type: str):
             from bert_score import score
             safe_candidate = narrative_text[:BERTSCORE_SAFE_LENGTH]
             safe_reference = reference_text[:BERTSCORE_SAFE_LENGTH]
+
+            # 【v6 修正】原始 BERTScore 有已知的「地板效應」：即使兩段語意完全
+            # 無關的中文句子，Cosine similarity 在 BERT 詞向量空間裡也普遍偏高，
+            # 導致分數天生就會落在偏高區間、鑑別力不足。rescale_with_baseline
+            # 會扣掉這個系統性偏差，讓分數更能反映「真正的語意差異」。
+            # 但這個 baseline 檔案是依 model_type + lang + num_layers 這組合
+            # 預先算好放在套件內建清單裡的，hfl/chinese-roberta-wwm-ext 不一定
+            # 在清單內，所以這裡用 try/except 包起來：校準版本抓不到 baseline
+            # 檔案時，直接印出原因並退回未校準分數，不讓整個報告生成流程失敗。
+            rescaled_P = rescaled_R = rescaled_F1 = None
+            try:
+                rP, rR, rF1 = score(
+                    [safe_candidate],
+                    [safe_reference],
+                    lang="zh",
+                    model_type="hfl/chinese-roberta-wwm-ext",
+                    num_layers=12,
+                    device="cuda",
+                    nthreads=1,
+                    batch_size=1,
+                    rescale_with_baseline=True,
+                )
+                rescaled_P, rescaled_R, rescaled_F1 = rP.item(), rR.item(), rF1.item()
+            except Exception as rescale_error:
+                print(
+                    "ℹ️ [BERTScore] 此模型/語言組合沒有對應的 baseline 校準檔案，"
+                    f"退回未校準分數（原因：{rescale_error}）"
+                )
+
             P, R, F1 = score(
                 [safe_candidate],
                 [safe_reference],
@@ -266,9 +295,18 @@ async def _generate_report_async(incident_id: int, event_type: str):
                 batch_size=1,
             )
             print(
-                f"📊 [BERTScore] Precision={P.item():.4f}  "
+                f"📊 [BERTScore 原始分數] Precision={P.item():.4f}  "
                 f"Recall={R.item():.4f}  F1={F1.item():.4f}"
             )
+            if rescaled_F1 is not None:
+                print(
+                    f"📊 [BERTScore 校準後分數] Precision={rescaled_P:.4f}  "
+                    f"Recall={rescaled_R:.4f}  F1={rescaled_F1:.4f}"
+                )
+                print(
+                    "   （校準後分數扣掉了 BERT 詞向量空間的系統性偏差，"
+                    "更能反映報告與參考答案之間真正的語意差異程度）"
+                )
             print(
                 f"   （註：評分僅取報告前 {BERTSCORE_SAFE_LENGTH} 字元，"
                 "且已排除結尾的驗證用JSON區塊，只評分敘述正文）"

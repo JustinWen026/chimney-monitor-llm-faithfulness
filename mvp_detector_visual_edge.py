@@ -27,6 +27,14 @@ CAMERA_SOURCES = {
 ALERT_THRESHOLD_SEC = 3.0
 ALERT_COOLDOWN_SEC = 60.0
 
+# 【v9新增】FSM 重置容忍期：原本邏輯是「這一影格沒偵測到異常」就立刻把
+# ACCUMULATING/TRIGGERED 狀態打回 NORMAL、累積時間歸零。但 YOLO 偶爾會因為
+# 遮擋、瞬間反光、動態模糊等原因單一影格漏判，導致狀態機在 ACCUMULATING
+# 跟 NORMAL 之間來回閃爍，也可能讓真正持續中的異常事件因為反覆被重置而
+# 遲遲無法觸發警報。改成「連續無異常超過這個秒數」才真的重置，其餘時間
+# 視為短暫雜訊、繼續維持原本的累積狀態。
+RESET_GRACE_SEC = 1.0
+
 CONFIDENCE_THRESHOLD = 0.5
 
 ENABLE_PREPROCESS = True
@@ -163,6 +171,7 @@ def process_camera_stream(camera_id, video_path, model):
   active_anomaly_type = None
   duration = 0.0
   last_alert_time = 0.0
+  last_anomaly_seen_time = None
 
   video_fps = cap.get(cv2.CAP_PROP_FPS)
   frame_interval = 1.0 / video_fps if video_fps > 0 else 1.0 / 30
@@ -221,11 +230,13 @@ def process_camera_stream(camera_id, video_path, model):
         if has_anomaly:
           current_state = "ACCUMULATING"
           anomaly_start_time = current_time
+          last_anomaly_seen_time = current_time
           active_anomaly_type = current_frame_anomaly
 
       elif current_state == "ACCUMULATING":
         if has_anomaly:
           active_anomaly_type = current_frame_anomaly
+          last_anomaly_seen_time = current_time
           duration = current_time - anomaly_start_time
 
           if duration >= ALERT_THRESHOLD_SEC:
@@ -281,18 +292,30 @@ def process_camera_stream(camera_id, video_path, model):
               )
               last_alert_time = current_time
         else:
-          safe_print(camera_id, "🟢 異常中斷，狀態機重置回 NORMAL")
-          current_state = "NORMAL"
-          anomaly_start_time = None
+          if last_anomaly_seen_time is not None and (current_time - last_anomaly_seen_time) < RESET_GRACE_SEC:
+            # 【v9新增】容忍期內：這一影格雖然沒偵測到異常，但距離上一次
+            # 偵測到異常還在容忍秒數內，視為短暫雜訊，不重置狀態機，
+            # duration 依然按照真實經過時間累加，維持原本的累積進度。
+            duration = current_time - anomaly_start_time
+          else:
+            safe_print(camera_id, "🟢 異常中斷，狀態機重置回 NORMAL")
+            current_state = "NORMAL"
+            anomaly_start_time = None
+            last_anomaly_seen_time = None
 
       elif current_state == "TRIGGERED":
         if has_anomaly:
           active_anomaly_type = current_frame_anomaly
+          last_anomaly_seen_time = current_time
           duration = current_time - anomaly_start_time
         else:
-          safe_print(camera_id, "🟢 工安危機解除，狀態機重置")
-          current_state = "NORMAL"
-          anomaly_start_time = None
+          if last_anomaly_seen_time is not None and (current_time - last_anomaly_seen_time) < RESET_GRACE_SEC:
+            duration = current_time - anomaly_start_time
+          else:
+            safe_print(camera_id, "🟢 工安危機解除，狀態機重置")
+            current_state = "NORMAL"
+            anomaly_start_time = None
+            last_anomaly_seen_time = None
 
       bar_x, bar_y = 10, 40
       bar_width, bar_height = 120, 8
