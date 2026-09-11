@@ -38,11 +38,10 @@ from db_manager import DB_PATH
 OLLAMA_URL_CHAT = "http://localhost:11434/api/chat"
 MODEL_NAME = "qwen2.5:7b-instruct"
 
-# 【v15】現在是四組（Baseline / Tool-only / Proposed / Proposed-NoReminder）
-# 各跑 N_RUNS 次，共 4×N_RUNS 次。N_RUNS=10 時總共 40 次，三組要起 MCP
-# 子行程+多輪LLM呼叫，抓 15~25 分鐘跑完。時間緊迫可先調到 5~6 測試流程，
-# 正式數據再調回 10 以上。你上次用 N=30 大約90次跑完，這次多一組，
-# 時間會抓得更長，建議先用小 N 測過一輪流程沒問題再跑正式的大 N。
+# 現在是三組（Baseline / Tool-only / Proposed）各跑 N_RUNS 次，共 3×N_RUNS 次。
+# N_RUNS=10 時總共 30 次，Tool-only 跟 Proposed 都要起 MCP 子行程，
+# 抓 10~20 分鐘跑完。時間緊迫可先調到 5~6 測試流程是否正常，
+# 正式數據再調回 10 以上。
 N_RUNS = 10
 MAX_ITERATIONS = 2
 
@@ -79,10 +78,24 @@ FAKE_TS_1 = "13:25:00"
 FAKE_TS_2 = "13:47:02"
 FAKE_FRAME_RATE = "29.8 FPS"
 
-HALLUCINATION_TRIGGERS = [
-    FAKE_CAMERA_ID, FAKE_WIND_SPEED, "SO2", "NOx", "0.08 ppm", "0.15 ppm",
-    FAKE_EMAIL, FAKE_TS_1, FAKE_TS_2, FAKE_FRAME_RATE, "contrast",
-]
+# 【修正】原本是一份扁平清單，逐字比對加總——但雜訊日誌裡有些假資訊本來
+# 就是「綁在同一句話裡」出現的（例如「SO2濃度0.08 ppm，NOx濃度0.15 ppm」），
+# 模型只要把這句話整句抄一遍，一個引用動作就被算成4分，把幻覺數字灌水到
+# 看起來比實際「犯錯次數」誇張。改成分組計分：同一組雜訊來源，不管命中
+# 裡面幾個字眼，都只算1分，才能反映「引用了幾種不同的雜訊」而不是
+# 「引用的雜訊裡剛好包含幾個可比對的字眼」。
+HALLUCINATION_TRIGGER_GROUPS = {
+    "假攝影機編號": [FAKE_CAMERA_ID],
+    "假風速": [FAKE_WIND_SPEED],
+    "假空氣品質數據": ["SO2", "NOx", "0.08 ppm", "0.15 ppm"],
+    "假email通知": [FAKE_EMAIL],
+    "假時間戳雜訊": [FAKE_TS_1, FAKE_TS_2],
+    "假影像處理參數": [FAKE_FRAME_RATE, "contrast"],
+}
+
+# 保留舊變數名稱以維持相容性（部分程式碼可能還引用它列出所有字眼，
+# 例如錯誤訊息或除錯輸出，這裡攤平成同一份清單）。
+HALLUCINATION_TRIGGERS = [kw for group in HALLUCINATION_TRIGGER_GROUPS.values() for kw in group]
 
 
 def build_noisy_log(gt: dict) -> str:
@@ -133,7 +146,24 @@ def fetch_latest_incident_id() -> int:
 
 
 def score_hallucination(text: str) -> int:
-    return sum(1 for kw in HALLUCINATION_TRIGGERS if kw.lower() in text.lower())
+    """依分組計分：同一組雜訊來源（例如假空氣品質數據裡的SO2/NOx/兩個ppm值）
+    不管命中組內幾個字眼，都只算1分，避免同一次引用動作被重複灌水。
+    滿分現在是 6 分（對應 6 個雜訊分組），不是舊版的 11 分。"""
+    text_lower = text.lower()
+    return sum(
+        1 for keywords in HALLUCINATION_TRIGGER_GROUPS.values()
+        if any(kw.lower() in text_lower for kw in keywords)
+    )
+
+
+def get_hallucination_groups_hit(text: str) -> list:
+    """回傳實際命中的雜訊分組名稱（而非逐字命中清單），方便論文或除錯時
+    直接看懂「引用了哪幾種雜訊」，而不是一堆容易誤解為4倍嚴重的字眼列表。"""
+    text_lower = text.lower()
+    return [
+        group_name for group_name, keywords in HALLUCINATION_TRIGGER_GROUPS.items()
+        if any(kw.lower() in text_lower for kw in keywords)
+    ]
 
 
 # ── Baseline 組：模擬「沒有工具、沒有驗證」的舊做法 ──────────────────────────
@@ -199,7 +229,7 @@ async def run_baseline_once(gt: dict) -> dict:
         "grounding_score": grounding["score"],
         "incident_id_mentioned": grounding["incident_id_mentioned"],
         "hallucination_count": score_hallucination(text),
-        "hallucination_keywords_hit": [kw for kw in HALLUCINATION_TRIGGERS if kw.lower() in text.lower()],
+        "hallucination_keywords_hit": get_hallucination_groups_hit(text),
         "iterations_used": 1,
         "output_text": text,
     }
@@ -207,32 +237,21 @@ async def run_baseline_once(gt: dict) -> dict:
 
 # ── Proposed 組：完整複刻 report_generator_v7 的工具驗證＋迭代邏輯 ──────────
 
-def _build_proposed_prompt(incident_id: int, gt: dict, include_noise_reminder: bool = True) -> str:
+def _build_proposed_prompt(incident_id: int, gt: dict) -> str:
     """【v12 修正】加入跟 Baseline 組完全相同的雜訊日誌，明確告知這段日誌
     可能含雜訊、正式數據以工具查詢結果為準。這樣才是公平且有意義的對照：
     兩組看到的雜訊完全一樣，唯一差異是有沒有強制工具查證＋欄位驗證，
-    藉此測試這個機制是否真的能讓模型不被旁邊的雜訊帶著走。
-
-    【v15 新增】include_noise_reminder 控制要不要加入「日誌可能含雜訊，
-    請以工具結果為準」這句提醒。加這個開關是為了獨立測試「這句提醒本身」
-    的邊際效果，而不是直接把它拿掉重跑——拿掉重跑、只呈現對自己有利的
-    那個版本，等於是看到不喜歡的結果後回頭調整方法，這是研究方法上的
-    大忌（researcher degrees of freedom / 事後選擇性報告）。兩個版本都跑、
-    都誠實呈現，才能乾淨地回答「這句提醒到底有沒有造成影響」這個問題。"""
+    藉此測試這個機制是否真的能讓模型不被旁邊的雜訊帶著走。"""
     fields_hint = "、".join(VERIFICATION_FIELDS)
     noisy_log = build_noisy_log(gt)
-    reminder_clause = (
-        "（若與上方日誌內容有出入，一律以工具查詢結果為準，不可採信日誌裡"
-        "其他無關的雜訊內容）"
-        if include_noise_reminder else ""
-    )
     return (
         f"【工安事件通報】以下是後台系統的原始日誌，可能包含雜訊或無關資訊：\n"
         f"{noisy_log}\n\n"
         f"本次目標事件的 incident_id 為 {incident_id}。"
         "請你【必須】立刻調用 `get_incident_by_id` 工具，"
         f"並傳入參數 incident_id={incident_id}，取得該筆事件的權威結構化資料"
-        f"{reminder_clause}。取得資料後：\n"
+        "（若與上方日誌內容有出入，一律以工具查詢結果為準，不可採信日誌裡"
+        "其他無關的雜訊內容）。取得資料後：\n"
         "1. 生成一份專業的中文事故初報，內容需包含：事件摘要、歸因判定、"
         "風險等級、建議處置、追蹤建議。\n"
         "2. 在報告最後，另起一段，附上一個 ```json 區塊```，"
@@ -242,7 +261,7 @@ def _build_proposed_prompt(incident_id: int, gt: dict, include_noise_reminder: b
     )
 
 
-async def run_proposed_once(gt: dict, include_noise_reminder: bool = True) -> dict:
+async def run_proposed_once(gt: dict) -> dict:
     incident_id = gt["incident_id"]
     start = time.time()
     tool_was_called = False
@@ -261,7 +280,7 @@ async def run_proposed_once(gt: dict, include_noise_reminder: bool = True) -> di
                 for t in tools_response.tools
             ]
 
-            messages = [{"role": "user", "content": _build_proposed_prompt(incident_id, gt, include_noise_reminder)}]
+            messages = [{"role": "user", "content": _build_proposed_prompt(incident_id, gt)}]
 
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -338,22 +357,15 @@ async def run_proposed_once(gt: dict, include_noise_reminder: bool = True) -> di
     narrative_text = re.sub(r"```json\s*\{.*?\}\s*```", "", full_text, flags=re.DOTALL)
     final_valid = iteration_valid_flags[-1] if iteration_valid_flags else False
     return {
-        "condition": "proposed" if include_noise_reminder else "proposed_no_reminder",
+        "condition": "proposed",
         "elapsed": elapsed,
         "grounding_score": 1.0 if final_valid else 0.0,
         "hallucination_count": score_hallucination(narrative_text),
-        "hallucination_keywords_hit": [kw for kw in HALLUCINATION_TRIGGERS if kw.lower() in narrative_text.lower()],
+        "hallucination_keywords_hit": get_hallucination_groups_hit(narrative_text),
         "iterations_used": len(iteration_valid_flags),
         "tool_was_called": tool_was_called,
         "output_text": narrative_text,
     }
-
-
-async def run_proposed_no_reminder_once(gt: dict) -> dict:
-    """【v15新增】跟 run_proposed_once 完全相同的機制（工具+驗證+迭代），
-    唯一差異是 prompt 裡不加「日誌可能含雜訊，請以工具結果為準」這句話，
-    用來獨立測試這句提醒指令本身的邊際效果。"""
-    return await run_proposed_once(gt, include_noise_reminder=False)
 
 
 def _build_tool_only_prompt(incident_id: int, gt: dict) -> str:
@@ -446,7 +458,7 @@ async def run_tool_only_once(gt: dict) -> dict:
         "grounding_score": grounding["score"],
         "incident_id_mentioned": grounding["incident_id_mentioned"],
         "hallucination_count": score_hallucination(full_text),
-        "hallucination_keywords_hit": [kw for kw in HALLUCINATION_TRIGGERS if kw.lower() in full_text.lower()],
+        "hallucination_keywords_hit": get_hallucination_groups_hit(full_text),
         "iterations_used": 1,
         "tool_was_called": tool_was_called,
         "output_text": full_text,
@@ -503,24 +515,16 @@ async def main():
     gt = fetch_ground_truth(incident_id)
 
     print(f"\n{'=' * 70}")
-    print(f"   消融實驗 v15 — 拆解「工具查證」「驗證+迭代重試」「雜訊提醒指令」")
-    print(f"   各自的邊際貢獻")
+    print(f"   消融實驗 v12 — 拆解「工具查證」與「驗證+迭代重試」各自的貢獻")
     print(f"   Ground Truth 事件：#{gt['incident_id']}  {gt['camera_id']}  "
           f"{gt['event_type']}  風險等級{gt['risk_level']}")
-    print(f"   模型: {MODEL_NAME}  |  每組 N={N_RUNS}，隨機順序，共 {N_RUNS * 4} 次")
+    print(f"   模型: {MODEL_NAME}  |  每組 N={N_RUNS}，隨機順序，共 {N_RUNS * 3} 次")
     print(f"{'=' * 70}")
 
-    # 【v15新增】proposed_no_reminder：跟 Proposed 完全一樣的機制（工具+驗證+
-    # 迭代），唯一差異是拿掉「日誌可能含雜訊，請以工具結果為準」這句提醒。
-    # 加這一組是為了回答「這句提醒指令本身有沒有造成 Proposed 組幻覺數偏高」
-    # 這個問題，而且是「兩個版本都跑、都攤開來看」，不是拿掉重跑取代原本結果
-    # ——後者等於是看到不喜歡的結果才回頭調整方法，是研究方法上的大忌。
-    conditions = (
-        (["baseline"] * N_RUNS)
-        + (["tool_only"] * N_RUNS)
-        + (["proposed"] * N_RUNS)
-        + (["proposed_no_reminder"] * N_RUNS)
-    )
+    # 【v12 三組消融】原本只比較「全有」vs「全無」，只能回答「整套機制有沒有用」，
+    # 回答不了「到底是工具本身有用，還是驗證+重試這個機制本身有用」。
+    # 加入 tool_only 中間組，才是名符其實的『消融』：逐步拿掉元件，看各自貢獻。
+    conditions = (["baseline"] * N_RUNS) + (["tool_only"] * N_RUNS) + (["proposed"] * N_RUNS)
     import random
     random.shuffle(conditions)
 
@@ -529,17 +533,15 @@ async def main():
     condition_labels = {
         "baseline": "Baseline（無工具/無驗證）",
         "tool_only": "Tool-only（有工具/無驗證重試）",
-        "proposed": "Proposed（工具+驗證+迭代，含雜訊提醒）",
-        "proposed_no_reminder": "Proposed-NoReminder（工具+驗證+迭代，無雜訊提醒）",
+        "proposed": "Proposed（工具+驗證+迭代）",
     }
     condition_funcs = {
         "baseline": run_baseline_once,
         "tool_only": run_tool_only_once,
         "proposed": run_proposed_once,
-        "proposed_no_reminder": run_proposed_no_reminder_once,
     }
 
-    results_by_condition = {"baseline": [], "tool_only": [], "proposed": [], "proposed_no_reminder": []}
+    results_by_condition = {"baseline": [], "tool_only": [], "proposed": []}
     for i, condition in enumerate(conditions):
         print(f"▶ Run {i + 1:02d}/{len(conditions)} [{condition_labels[condition]}]", flush=True)
         r = await condition_funcs[condition](gt)
@@ -552,44 +554,40 @@ async def main():
     b = summarize(results_by_condition["baseline"])
     t = summarize(results_by_condition["tool_only"])
     p = summarize(results_by_condition["proposed"])
-    pn = summarize(results_by_condition["proposed_no_reminder"])
 
-    print(f"\n\n{'=' * 116}")
-    print(f"          消融實驗結果對比（N={N_RUNS} each，共 {N_RUNS * 4} 次）")
+    print(f"\n\n{'=' * 96}")
+    print(f"          消融實驗結果對比（N={N_RUNS} each，共 {N_RUNS * 3} 次）")
     print(f"          Ground Truth 事件：#{gt['incident_id']}（{gt['event_type']}）")
-    print(f"{'=' * 116}")
-    print(f"{'指標':<16} {'Baseline':<18} {'Tool-only':<18} {'Proposed(含提醒)':<20} {'Proposed(無提醒)':<20}")
-    print("-" * 116)
-    print(f"{'★ 欄位忠實度':<16} {b['grounding_mean']:.1%}±{b['grounding_std']:.1%}"
-          f"{'':<8} {t['grounding_mean']:.1%}±{t['grounding_std']:.1%}"
-          f"{'':<8} {p['grounding_mean']:.1%}±{p['grounding_std']:.1%}"
-          f"{'':<10} {pn['grounding_mean']:.1%}±{pn['grounding_std']:.1%}")
-    print(f"{'★ 平均幻覺數':<16} {b['hallucination_mean']:.2f}±{b['hallucination_std']:.2f}"
-          f"{'':<11} {t['hallucination_mean']:.2f}±{t['hallucination_std']:.2f}"
-          f"{'':<11} {p['hallucination_mean']:.2f}±{p['hallucination_std']:.2f}"
-          f"{'':<13} {pn['hallucination_mean']:.2f}±{pn['hallucination_std']:.2f}")
-    print(f"{'平均耗時':<16} {b['elapsed_mean']:.2f}±{b['elapsed_std']:.2f} s"
-          f"{'':<8} {t['elapsed_mean']:.2f}±{t['elapsed_std']:.2f} s"
-          f"{'':<8} {p['elapsed_mean']:.2f}±{p['elapsed_std']:.2f} s"
-          f"{'':<10} {pn['elapsed_mean']:.2f}±{pn['elapsed_std']:.2f} s")
-    print(f"{'平均迭代輪數':<16} {b['iterations_mean']:.2f}"
-          f"{'':<17} {t['iterations_mean']:.2f}"
-          f"{'':<17} {p['iterations_mean']:.2f}"
-          f"{'':<19} {pn['iterations_mean']:.2f}")
-    print(f"{'=' * 116}\n")
+    print(f"{'=' * 96}")
+    print(f"{'指標':<18} {'Baseline':<20} {'Tool-only':<20} {'Proposed':<20}")
+    print(f"{'':<18} {'(無工具/無驗證)':<20} {'(有工具/無驗證重試)':<20} {'(工具+驗證+迭代)':<20}")
+    print("-" * 96)
+    print(f"{'★ 欄位忠實度':<18} {b['grounding_mean']:.1%}±{b['grounding_std']:.1%}"
+          f"{'':<10} {t['grounding_mean']:.1%}±{t['grounding_std']:.1%}"
+          f"{'':<10} {p['grounding_mean']:.1%}±{p['grounding_std']:.1%}")
+    print(f"{'★ 平均幻覺數':<18} {b['hallucination_mean']:.2f}±{b['hallucination_std']:.2f}"
+          f"{'':<13} {t['hallucination_mean']:.2f}±{t['hallucination_std']:.2f}"
+          f"{'':<13} {p['hallucination_mean']:.2f}±{p['hallucination_std']:.2f}")
+    print(f"{'平均耗時':<18} {b['elapsed_mean']:.2f}±{b['elapsed_std']:.2f} s"
+          f"{'':<10} {t['elapsed_mean']:.2f}±{t['elapsed_std']:.2f} s"
+          f"{'':<10} {p['elapsed_mean']:.2f}±{p['elapsed_std']:.2f} s")
+    print(f"{'平均迭代輪數':<18} {b['iterations_mean']:.2f}"
+          f"{'':<19} {t['iterations_mean']:.2f}"
+          f"{'':<19} {p['iterations_mean']:.2f}")
+    print(f"{'=' * 96}\n")
 
-    # incident_id 是否被提及僅供參考，不計入主要忠實度分數
+    # 【v14新增】incident_id 是否被提及僅供參考，不計入主要忠實度分數
     # （理由見 score_grounding_baseline 的說明）。
     b_id_rate = sum(1 for r in results_by_condition["baseline"] if r.get("incident_id_mentioned")) / len(results_by_condition["baseline"])
     t_id_rate = sum(1 for r in results_by_condition["tool_only"] if r.get("incident_id_mentioned")) / len(results_by_condition["tool_only"])
     print(f"（參考資訊，未計入忠實度分數）內部事件編號被主動提及比例："
           f"Baseline {b_id_rate:.0%}　Tool-only {t_id_rate:.0%}　"
-          "（Proposed 系列因強制輸出JSON，恆為100%，故不比較意義不大）\n")
+          "（Proposed 因強制輸出JSON，恆為100%，故不比較意義不大）\n")
 
-    print("💡 Tool-only 拆解出「單純擁有工具查證資料」的貢獻；Proposed(含提醒)")
-    print("   在此之上再加上強制驗證＋迭代重試；Proposed(無提醒) 則是拿掉雜訊")
-    print("   提醒指令、保留驗證+迭代機制本身。三者互相對照才能回答：幻覺數的")
-    print("   高低到底是『驗證機制本身』的問題，還是『提醒指令措辭』造成的。")
+    print("💡 三組看到完全相同、摻雜真實資料與植入假雜訊的原始日誌。")
+    print("   Tool-only 組拆解出「單純擁有工具查證資料」的貢獻；")
+    print("   Proposed 組在此之上再加上強制驗證＋迭代重試，兩者之差")
+    print("   才是『驗證+重試機制本身』的貢獻，而不是工具本身的貢獻。")
     print("   幻覺數計算的是「植入的假雜訊」出現在報告裡的次數，這些值是")
     print("   我們自己造的，只要出現就可判定為雜訊污染，但無法區分模型是")
     print("   『誤把雜訊當事實』還是『正確提及並排除雜訊』——兩者都會被計入，")
@@ -608,24 +606,19 @@ async def main():
             "本測試為研究者自行設計之受控雜訊情境（自行植入已知為假的雜訊內容，"
             "非取自真實事故資料），用於診斷工具驗證與迭代重試機制的相對效果，"
             "樣本為單一模型（qwen2.5:7b-instruct）、單一 ground truth 事件、"
-            f"每組 N={N_RUNS} 之小樣本結果。新增 proposed_no_reminder 組是為了"
-            "獨立驗證『雜訊提醒指令』本身的邊際效果，採兩版本並陳而非取代，"
-            "避免因結果好壞回頭調整方法造成之選擇性報告偏誤。幻覺計數以關鍵字"
-            "比對實作，無法區分『誤採信雜訊為事實』與『正確提及並排除雜訊』"
-            "兩種不同行為，建議人工複核 output_text 欄位以確認自動化評分之"
-            "有效性。本結果不宣稱涵蓋真實世界所有幻覺樣態，亦不宣稱可推論至"
-            "其他模型或情境。"
+            f"每組 N={N_RUNS} 之小樣本結果。幻覺計數以關鍵字比對實作，"
+            "無法區分『誤採信雜訊為事實』與『正確提及並排除雜訊』兩種不同行為，"
+            "建議人工複核 output_text 欄位以確認自動化評分之有效性。"
+            "本結果不宣稱涵蓋真實世界所有幻覺樣態，亦不宣稱可推論至其他模型或情境。"
         ),
         "baseline_summary": b,
         "tool_only_summary": t,
         "proposed_summary": p,
-        "proposed_no_reminder_summary": pn,
         "raw_baseline": results_by_condition["baseline"],
         "raw_tool_only": results_by_condition["tool_only"],
         "raw_proposed": results_by_condition["proposed"],
-        "raw_proposed_no_reminder": results_by_condition["proposed_no_reminder"],
     }
-    out_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_v15.json"
+    out_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_v16.json"
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
@@ -633,7 +626,7 @@ async def main():
     except Exception:
         # 若不在 Windows 專案路徑下執行（例如先在其他環境測試語法），
         # 退回存在目前工作目錄，不讓實驗結果因路徑問題而遺失。
-        fallback_path = "ablation_results_v15.json"
+        fallback_path = "ablation_results_v16.json"
         with open(fallback_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
         print(f"📂 詳細數據已存至 {fallback_path}（預設路徑不可寫入，已退回目前目錄）\n")
