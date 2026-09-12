@@ -1,23 +1,40 @@
 """
-ablation_study_v10.py
+ablation_study_v17.py
 ----------------------
-針對目前 v10 架構（report_generator_v7 的工具驗證 + 迭代閉環機制）設計的消融實驗。
+【本版定位：整條校準路徑圖的「階段一」】
 
-跟舊版 ablation_study_v6.py 的核心差異：
-  - 舊版比較「有無 MCP 結構化輸入」對輸出格式完整度的影響，評分方式是
-    關鍵字命中 + 內容長度，測的是「像不像一份報告」。
-  - 這版比較「有無強制工具呼叫 + 欄位驗證 + 迭代重試」對「報告內容是否
-    忠實反映資料庫真實記錄」的影響，這才是本研究真正要證明的主張：
-    LLM 生成內容的可信度可以被驗證、也可以透過迭代機制被修正。
+在拉大樣本數、換模型、補測事件類型、改進幻覺量測方法之前，我們先確認一件事：
+現有的驗證＋迭代重試機制，有沒有機會被真正考驗過？答案是沒有——不管換哪個事件、
+拉多高溫度，Proposed 組的迭代輪數始終是 1.00，因為驗證任務（把工具剛回傳的幾個
+短欄位值逐字複製）對 LLM 來說太簡單，天生就很難出錯。這一版的目標，就是在
+「不扭曲評分標準、不為了讓數字好看而調整方法」的前提下，把測試情境設計得
+更嚴苛，讓迭代重試機制真的有機會被觸發、被驗證。
 
-兩組使用同一筆真實資料庫事件（而非虛構數據）當作 ground truth，
-確保比較是公平的、且跟正式系統一致。
+完整校準路徑圖（本版是第①步）：
+  ① 修好迭代觸發機制（本版）→ ② 幻覺量測改語意層級判斷 → ③ BERTScore換有
+  官方baseline的模型（可與②並行）→ ④ 補測多種事件類型（複用資料庫既有事件，
+  不用重錄影片）→ ⑤ 多模型比較 + 拉大樣本數（放最後，因為運算量最大，
+  前面步驟沒校準好會白做工）。
+
+本版做的三個改動（同時上，因為目標是「打造夠嚴苛的綜合壓力測試」，
+不是要逐一拆解各自貢獻）：
+  1. 擴充驗證欄位：從 6 個增加到 8 個（新增 duration_seconds、status），
+     欄位越多，全部一字不差抄對的機率越低（機率是乘法效應）。
+  2. 拉開推理距離：原本是「工具回傳資料」後緊接著「請輸出JSON」，改成
+     中間插入一段「先寫初步分析」的步驟，讓最終輸出JSON的時間點離看到
+     原始資料更遠，更接近真實多輪對話情境，也更容易在複製時出現偏移。
+  3. 放相似干擾值：雜訊日誌裡新增一個「長得像但不是的攝影機編號」
+     （例如真實是 CAM-01，雜訊放 CAM-01B），測試模型會不會搞混。
+
+跟上一版 ablation_study_v14/v16 的核心差異，就是以上三點；三組消融的
+基本設計（Baseline / Tool-only / Proposed）、分組計分的幻覺量測邏輯、
+評分公平性的修正（拿掉incident_id、繁簡體變體）全部沿用不動。
 
 執行方式：
     conda activate smoke
     cd D:\\NCKU_paper_Capstone_Project
-    python ablation_study_v10.py                 # 自動抓資料庫最新一筆事件
-    python ablation_study_v10.py 46               # 指定 incident_id=46
+    python ablation_study_v17.py                 # 自動抓資料庫最新一筆事件
+    python ablation_study_v17.py 54               # 指定 incident_id=54
 """
 
 import asyncio
@@ -42,11 +59,15 @@ MODEL_NAME = "qwen2.5:7b-instruct"
 # N_RUNS=10 時總共 30 次，Tool-only 跟 Proposed 都要起 MCP 子行程，
 # 抓 10~20 分鐘跑完。時間緊迫可先調到 5~6 測試流程是否正常，
 # 正式數據再調回 10 以上。
-N_RUNS = 10
+N_RUNS = 5
 MAX_ITERATIONS = 2
 
 server_params = StdioServerParameters(command="python", args=["mcp_server.py"])
-VERIFICATION_FIELDS = ["incident_id", "camera_id", "event_type", "severity", "risk_level", "timestamp"]
+# 【v17修正】從6個欄位擴充到8個，新增 duration_seconds、status。
+# 欄位越多，模型要一字不差全部抄對的機率越低（單欄位出錯機率固定的話，
+# 全對機率是各欄位機率的連乘，欄位數增加會讓全對機率明顯下降），
+# 藉此提高迭代重試機制被真正觸發的機會，而不是每次都第一輪就通過。
+VERIFICATION_FIELDS = ["incident_id", "camera_id", "event_type", "severity", "risk_level", "timestamp", "duration_seconds", "status"]
 
 # 事件類型對照中文關鍵詞，供 Baseline 組的自由文字輸出比對用
 # （Baseline 組沒有強制輸出結構化 JSON，只能用關鍵字比對是否有提到正確類型）
@@ -102,10 +123,18 @@ def build_noisy_log(gt: dict) -> str:
     """建立一段摻雜真實事件資料與植入假雜訊的原始日誌，模擬真實工安系統
     後台常見的、參雜大量無關資訊的原始 log。兩組（Baseline / Proposed）
     都會看到完全一樣的這段內容，唯一差異是 Proposed 組被要求另外呼叫
-    工具取得權威資料、且被告知這段日誌可能含雜訊。"""
+    工具取得權威資料、且被告知這段日誌可能含雜訊。
+
+    【v17新增】相似干擾攝影機編號：在真實攝影機編號旁邊，放一個長得很像
+    但不是同一支的假編號（例如真實是 CAM-01，雜訊放 CAM-01B），模擬真實
+    工安系統裡常見的「編號相近、容易混淆」情境，測試模型會不會把兩者搞混、
+    誤把干擾編號當成事發攝影機寫進報告。"""
+    decoy_camera_id = f"{gt['camera_id']}B"
     return (
         f"[INFO] {FAKE_TS_1} 系統心跳正常，Zone 巡檢無異常回報。\n"
         f"[DEBUG] {FAKE_CAMERA_ID} 影像對比度(contrast)調整，目前對比值 1.2。\n"
+        f"[INFO] {decoy_camera_id}（備援機位，非本次事發攝影機）短暫回報畫面"
+        "雜訊，經覆核為感測器雜訊，與本次事件無關。\n"
         f"[WARN] 現場風速感測器讀值為 {FAKE_WIND_SPEED}，偏強陣風，"
         "可能影響煙流擴散方向。\n"
         f"[INFO] 空氣品質監測：{FAKE_SO2}，{FAKE_NOX}，均在正常範圍。\n"
@@ -132,6 +161,12 @@ def fetch_ground_truth(incident_id: int) -> dict:
         "event_type": row["event_type"],
         "severity": row["severity"],
         "risk_level": row["risk_level"],
+        # 【v17新增】擴充驗證欄位，duration_seconds 對應資料庫的 duration
+        # 欄位（跟 mcp_server_v3.py 的 get_incident_by_id 回傳的鍵名一致），
+        # status 直接沿用資料庫欄位。這兩個都是 get_incident_by_id 本來就
+        # 會回傳的欄位，不需要額外修改 MCP Server。
+        "duration_seconds": row["duration"],
+        "status": row["status"],
     }
 
 
@@ -145,23 +180,33 @@ def fetch_latest_incident_id() -> int:
     return row[0]
 
 
-def score_hallucination(text: str) -> int:
+def _get_trigger_groups(gt: dict = None) -> dict:
+    """回傳完整的雜訊分組清單。【v17新增】干擾攝影機編號是依 ground truth
+    動態產生的（例如真實是CAM-01，干擾值是CAM-01B），沒辦法寫死在模組層級
+    的字典裡，所以額外用這個函式在有 gt 時動態補上這一組。"""
+    groups = dict(HALLUCINATION_TRIGGER_GROUPS)
+    if gt is not None:
+        groups["假相似干擾攝影機編號"] = [f"{gt['camera_id']}B"]
+    return groups
+
+
+def score_hallucination(text: str, gt: dict = None) -> int:
     """依分組計分：同一組雜訊來源（例如假空氣品質數據裡的SO2/NOx/兩個ppm值）
     不管命中組內幾個字眼，都只算1分，避免同一次引用動作被重複灌水。
-    滿分現在是 6 分（對應 6 個雜訊分組），不是舊版的 11 分。"""
+    傳入 gt 時會額外檢查 v17 新增的相似干擾攝影機編號這一組。"""
     text_lower = text.lower()
     return sum(
-        1 for keywords in HALLUCINATION_TRIGGER_GROUPS.values()
+        1 for keywords in _get_trigger_groups(gt).values()
         if any(kw.lower() in text_lower for kw in keywords)
     )
 
 
-def get_hallucination_groups_hit(text: str) -> list:
+def get_hallucination_groups_hit(text: str, gt: dict = None) -> list:
     """回傳實際命中的雜訊分組名稱（而非逐字命中清單），方便論文或除錯時
     直接看懂「引用了哪幾種雜訊」，而不是一堆容易誤解為4倍嚴重的字眼列表。"""
     text_lower = text.lower()
     return [
-        group_name for group_name, keywords in HALLUCINATION_TRIGGER_GROUPS.items()
+        group_name for group_name, keywords in _get_trigger_groups(gt).items()
         if any(kw.lower() in text_lower for kw in keywords)
     ]
 
@@ -215,7 +260,7 @@ async def run_baseline_once(gt: dict) -> dict:
             json={
                 "model": MODEL_NAME,
                 "messages": [{"role": "user", "content": prompt}],
-                "options": {"temperature": 0.3},
+                "options": {"temperature": 0.8},
                 "stream": False,
             },
             timeout=60.0,
@@ -228,8 +273,8 @@ async def run_baseline_once(gt: dict) -> dict:
         "elapsed": elapsed,
         "grounding_score": grounding["score"],
         "incident_id_mentioned": grounding["incident_id_mentioned"],
-        "hallucination_count": score_hallucination(text),
-        "hallucination_keywords_hit": get_hallucination_groups_hit(text),
+        "hallucination_count": score_hallucination(text, gt),
+        "hallucination_keywords_hit": get_hallucination_groups_hit(text, gt),
         "iterations_used": 1,
         "output_text": text,
     }
@@ -289,7 +334,7 @@ async def run_proposed_once(gt: dict) -> dict:
                         "model": MODEL_NAME,
                         "messages": messages,
                         "tools": available_tools,
-                        "options": {"temperature": 0.3},
+                        "options": {"temperature": 0.8},
                         "stream": False,
                     },
                     timeout=60.0,
@@ -311,6 +356,43 @@ async def run_proposed_once(gt: dict) -> dict:
                                 "name": "get_incident_by_id",
                             })
 
+                # 【v17新增：拉開推理距離】原本拿到工具結果後緊接著就要求輸出
+                # 最終報告+JSON，資料跟輸出幾乎是「複製貼上」等級的接近，模型
+                # 幾乎不會出錯。這裡插入一輪「先寫初步分析」的中間步驟，讓最終
+                # 需要精確複製欄位值的時間點，離看到原始資料的位置更遠，更接近
+                # 真實多輪對話情境，也更容易在複製過程中出現偏移、觸發驗證失敗
+                # 與後續的迭代重試。
+                if tool_was_called:
+                    prelim_prompt = (
+                        "在正式生成報告前，請先用不超過100字，寫一段初步情境判斷"
+                        "（純文字敘述，不需要包含JSON），簡述你從工具查詢結果看到了什麼。"
+                    )
+                    messages.append({"role": "user", "content": prelim_prompt})
+                    prelim_response = await client.post(
+                        OLLAMA_URL_CHAT,
+                        json={
+                            "model": MODEL_NAME,
+                            "messages": messages,
+                            "options": {"temperature": 0.8},
+                            "stream": False,
+                        },
+                        timeout=60.0,
+                    )
+                    prelim_text = prelim_response.json().get("message", {}).get("content", "")
+                    messages.append({"role": "assistant", "content": prelim_text})
+                    fields_hint_prelim = "、".join(VERIFICATION_FIELDS)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "很好，現在請根據上述初步判斷與稍早工具查詢到的資料，"
+                            "生成完整的正式事故初報（事件摘要、歸因判定、風險等級、"
+                            "建議處置、追蹤建議），並在報告最後附上一個 ```json 區塊```，"
+                            f"格式為包含以下欄位的 JSON 物件：{fields_hint_prelim}。"
+                            "JSON裡的每個值都必須跟工具查詢結果完全一致、逐字複製，"
+                            "不可以自行改寫格式、翻譯、四捨五入或憑印象填寫。"
+                        ),
+                    })
+
                 for iteration in range(1, MAX_ITERATIONS + 1):
                     if not tool_was_called and iteration == 1:
                         is_valid, mismatches = False, ["模型未呼叫 get_incident_by_id 工具"]
@@ -320,7 +402,7 @@ async def run_proposed_once(gt: dict) -> dict:
                             json={
                                 "model": MODEL_NAME,
                                 "messages": messages,
-                                "options": {"temperature": 0.3},
+                                "options": {"temperature": 0.8},
                                 "stream": False,
                             },
                             timeout=60.0,
@@ -360,8 +442,8 @@ async def run_proposed_once(gt: dict) -> dict:
         "condition": "proposed",
         "elapsed": elapsed,
         "grounding_score": 1.0 if final_valid else 0.0,
-        "hallucination_count": score_hallucination(narrative_text),
-        "hallucination_keywords_hit": get_hallucination_groups_hit(narrative_text),
+        "hallucination_count": score_hallucination(narrative_text, gt),
+        "hallucination_keywords_hit": get_hallucination_groups_hit(narrative_text, gt),
         "iterations_used": len(iteration_valid_flags),
         "tool_was_called": tool_was_called,
         "output_text": narrative_text,
@@ -387,7 +469,15 @@ def _build_tool_only_prompt(incident_id: int, gt: dict) -> str:
 
 
 async def run_tool_only_once(gt: dict) -> dict:
-    """中間組：呼叫一次工具、不驗證、不重試，單次生成即結束。"""
+    """中間組：呼叫一次工具、不驗證、不重試，單次生成即結束。
+
+    【v17說明】這一組刻意不套用「擴充驗證欄位」與「拉開推理距離」這兩項
+    v17新增的難度調整：擴充驗證欄位只影響 Proposed 組要求輸出的 JSON
+    比對邏輯，Tool-only 本來就沒有結構化驗證，加了也不會有作用；拉開推理
+    距離是為了增加「複製工具資料到最終JSON」這個任務出錯的機會，但
+    Tool-only 從頭到尾不會重試，套用這個步驟不會改變它的行為，只會白白
+    增加一次無意義的LLM呼叫。這組唯一會受到 v17 影響的地方，是三組共用的
+    雜訊日誌裡新增的相似干擾攝影機編號。"""
     incident_id = gt["incident_id"]
     start = time.time()
     tool_was_called = False
@@ -413,7 +503,7 @@ async def run_tool_only_once(gt: dict) -> dict:
                         "model": MODEL_NAME,
                         "messages": messages,
                         "tools": available_tools,
-                        "options": {"temperature": 0.3},
+                        "options": {"temperature": 0.8},
                         "stream": False,
                     },
                     timeout=60.0,
@@ -441,7 +531,7 @@ async def run_tool_only_once(gt: dict) -> dict:
                     json={
                         "model": MODEL_NAME,
                         "messages": messages,
-                        "options": {"temperature": 0.3},
+                        "options": {"temperature": 0.8},
                         "stream": False,
                     },
                     timeout=60.0,
@@ -457,8 +547,8 @@ async def run_tool_only_once(gt: dict) -> dict:
         # 確保跟 Baseline 用同一把尺，才能公平看出「有工具」本身的貢獻。
         "grounding_score": grounding["score"],
         "incident_id_mentioned": grounding["incident_id_mentioned"],
-        "hallucination_count": score_hallucination(full_text),
-        "hallucination_keywords_hit": get_hallucination_groups_hit(full_text),
+        "hallucination_count": score_hallucination(full_text, gt),
+        "hallucination_keywords_hit": get_hallucination_groups_hit(full_text, gt),
         "iterations_used": 1,
         "tool_was_called": tool_was_called,
         "output_text": full_text,
@@ -515,7 +605,7 @@ async def main():
     gt = fetch_ground_truth(incident_id)
 
     print(f"\n{'=' * 70}")
-    print(f"   消融實驗 v12 — 拆解「工具查證」與「驗證+迭代重試」各自的貢獻")
+    print(f"   消融實驗 v17 — 階段一：擴充驗證欄位＋拉開推理距離＋相似干擾值，測試迭代重試能否被真正觸發")
     print(f"   Ground Truth 事件：#{gt['incident_id']}  {gt['camera_id']}  "
           f"{gt['event_type']}  風險等級{gt['risk_level']}")
     print(f"   模型: {MODEL_NAME}  |  每組 N={N_RUNS}，隨機順序，共 {N_RUNS * 3} 次")
@@ -618,7 +708,7 @@ async def main():
         "raw_tool_only": results_by_condition["tool_only"],
         "raw_proposed": results_by_condition["proposed"],
     }
-    out_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_v16.json"
+    out_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_v17.json"
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
@@ -626,7 +716,7 @@ async def main():
     except Exception:
         # 若不在 Windows 專案路徑下執行（例如先在其他環境測試語法），
         # 退回存在目前工作目錄，不讓實驗結果因路徑問題而遺失。
-        fallback_path = "ablation_results_v16.json"
+        fallback_path = "ablation_results_v17.json"
         with open(fallback_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
         print(f"📂 詳細數據已存至 {fallback_path}（預設路徑不可寫入，已退回目前目錄）\n")
