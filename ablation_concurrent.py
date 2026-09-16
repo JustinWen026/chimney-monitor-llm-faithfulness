@@ -1,7 +1,20 @@
 """
-ablation_study_multi.py
-------------------------
-【跟 ablation_study_v14/v17 系列的核心差異】
+ablation_study_multi_v2.py
+----------------------------
+【跟 ablation_study_multi（第一版）的差異】
+
+第一版有一個結構性bug：驗證失敗、要求模型「重新產生完整報告」的那次
+API呼叫沒有帶tools參數，如果失敗原因是「漏查了某筆事件」，模型此時已經
+沒有能力真的去補查，重試變成「叫它道歉，但沒給它修正的工具」。v2把
+「查工具」跟「寫報告」合併進同一個迭代迴圈，確保每一輪重試模型都真的
+有機會呼叫工具補齊缺漏的資料，讓迭代重試機制名符其實。
+
+v2 另外新增：
+  - mismatches_history：完整記錄每一輪驗證失敗的具體原因，方便直接
+    在論文裡引用「修正前錯在哪、修正後有沒有真的修好」的具體案例。
+  - 輸出檔名自動帶時間戳記，不會再每次執行就覆蓋掉上一次的結果。
+
+【跟 ablation_study_v14/v17 系列的核心差異，這部分v2沿用不變】
 
 v14/v17 系列測的是「一次只給一筆事件,LLM 能不能忠實複製這一筆的欄位」。
 這版測的是完全不同的問題：「同時給 LLM 好幾筆事件,它會不會把不同事件的
@@ -21,8 +34,10 @@ v14/v17 系列測的是「一次只給一筆事件,LLM 能不能忠實複製這�
 執行方式：
     conda activate smoke
     cd D:\\NCKU_paper_Capstone_Project
-    python ablation_study_multi.py                  # 自動抓資料庫最新 N 筆事件
-    python ablation_study_multi.py 52,54,55          # 指定 incident_id 清單（逗號分隔）
+    python ablation_study_multi_v2.py                  # 自動抓資料庫最新 N 筆事件
+    python ablation_study_multi_v2.py 52,54,55          # 指定 incident_id 清單（逗號分隔），
+                                                          # 建議挑三種不同事件類型，
+                                                          # 不要挑到同類型的雙胞胎事件
 """
 
 import asyncio
@@ -45,7 +60,7 @@ MODEL_NAME = "qwen2.5:7b-instruct"
 
 # 三組各跑幾次。多筆事件同時處理的 prompt 長、呼叫次數也比單筆版多，
 # 一次跑完會比 v17 慢不少，先用小 N 測過流程再拉大。
-N_RUNS = 5
+N_RUNS = 50
 MAX_ITERATIONS = 2
 
 # 同時處理幾筆事件。3 筆是一個合理的起點：夠讓「搞混」有機會發生，
@@ -295,11 +310,20 @@ def _verify_multi(llm_json_array, gts: list):
 
 
 async def run_proposed_once(gts: list) -> dict:
+    """【重要修正】舊版有一個結構性bug：如果第一輪模型漏查了某筆事件的
+    工具，系統要求「重新產生完整報告」時，那次 API 呼叫沒有帶 tools 參數，
+    等於模型此時已經沒有能力真的去補查漏掉的資料，只能瞎掰或承認做不到，
+    重試變成「叫它道歉，但沒給它修正的工具」。這版把「查工具」跟「寫報告」
+    合併進同一個迴圈：每一輪迭代都會先確保工具查完（查不完會一直嘗試，
+    上限是事件筆數+1次），查完才進入寫報告+驗證的步驟；驗證失敗要重試時，
+    下一輪一樣會先確認工具，模型如果被回饋『你漏查了某筆事件』，這次
+    真的有機會去把它補上，而不是被綁著手只能口頭道歉。"""
     incident_ids = [gt["incident_id"] for gt in gts]
     start = time.time()
     tool_called_ids = set()
     full_text = ""
     iteration_valid_flags = []
+    mismatches_history = []
 
     async with stdio_client(server_params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
@@ -314,129 +338,102 @@ async def run_proposed_once(gts: list) -> dict:
             ]
 
             messages = [{"role": "user", "content": _build_proposed_prompt_multi(incident_ids)}]
+            prelim_done = False
 
             async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    OLLAMA_URL_CHAT,
-                    json={
-                        "model": MODEL_NAME,
-                        "messages": messages,
-                        "tools": available_tools,
-                        "options": {"temperature": TEMPERATURE},
-                        "stream": False,
-                    },
-                    timeout=180.0,
-                )
-                message = response.json().get("message", {})
-
-                # 【多事件關鍵處理】模型可能在一次回應裡就發起多個 tool_calls
-                # （每個 incident_id 各一次），也可能一次只發起一個、需要靠
-                # 後續回合逐一補齊。這裡先把這一輪拿到的 tool_calls 全部處理掉。
-                if message.get("tool_calls"):
-                    messages.append(message)
-                    for tool_call in message["tool_calls"]:
-                        if tool_call["function"]["name"] == "get_incident_by_id":
-                            args = tool_call["function"].get("arguments", {})
-                            called_id = args.get("incident_id")
-                            try:
-                                called_id_int = int(called_id)
-                            except (TypeError, ValueError):
-                                called_id_int = None
-                            if called_id_int is not None:
-                                server_result = await session.call_tool(
-                                    "get_incident_by_id", arguments={"incident_id": called_id_int}
-                                )
-                                tool_called_ids.add(called_id_int)
-                                messages.append({
-                                    "role": "tool",
-                                    "content": server_result.content[0].text,
-                                    "name": "get_incident_by_id",
-                                })
-
-                # 若模型第一輪沒有把所有事件都查完，明確要求它把剩下的查完，
-                # 避免它跳過某幾筆就直接開始寫報告。
-                missing_ids = [i for i in incident_ids if i not in tool_called_ids]
-                if missing_ids:
-                    remind_msg = (
-                        f"你還沒有查詢以下 incident_id 的資料，請繼續呼叫 "
-                        f"`get_incident_by_id` 工具查詢：{', '.join(str(i) for i in missing_ids)}"
-                    )
-                    messages.append({"role": "user", "content": remind_msg})
-                    followup_response = await client.post(
-                        OLLAMA_URL_CHAT,
-                        json={
-                            "model": MODEL_NAME,
-                            "messages": messages,
-                            "tools": available_tools,
-                            "options": {"temperature": TEMPERATURE},
-                            "stream": False,
-                        },
-                        timeout=180.0,
-                    )
-                    followup_message = followup_response.json().get("message", {})
-                    if followup_message.get("tool_calls"):
-                        messages.append(followup_message)
-                        for tool_call in followup_message["tool_calls"]:
-                            if tool_call["function"]["name"] == "get_incident_by_id":
-                                args = tool_call["function"].get("arguments", {})
-                                called_id = args.get("incident_id")
-                                try:
-                                    called_id_int = int(called_id)
-                                except (TypeError, ValueError):
-                                    called_id_int = None
-                                if called_id_int is not None:
-                                    server_result = await session.call_tool(
-                                        "get_incident_by_id", arguments={"incident_id": called_id_int}
-                                    )
-                                    tool_called_ids.add(called_id_int)
-                                    messages.append({
-                                        "role": "tool",
-                                        "content": server_result.content[0].text,
-                                        "name": "get_incident_by_id",
-                                    })
-
-                # 【拉開推理距離，沿用v17】插入一段初步分析，讓最終需要精確
-                # 複製欄位值的時間點，離看到原始資料更遠。
-                missing_ids = [i for i in incident_ids if i not in tool_called_ids]
-                all_tools_called = len(tool_called_ids) == len(incident_ids)
-                if all_tools_called:
-                    prelim_prompt = (
-                        "在正式生成報告前，請先用不超過150字，寫一段初步情境判斷"
-                        "（純文字敘述，不需要包含JSON），簡述你從工具查詢結果看到"
-                        "了這幾筆事件的重點。"
-                    )
-                    messages.append({"role": "user", "content": prelim_prompt})
-                    prelim_response = await client.post(
-                        OLLAMA_URL_CHAT,
-                        json={
-                            "model": MODEL_NAME,
-                            "messages": messages,
-                            "options": {"temperature": TEMPERATURE},
-                            "stream": False,
-                        },
-                        timeout=180.0,
-                    )
-                    prelim_text = prelim_response.json().get("message", {}).get("content", "")
-                    messages.append({"role": "assistant", "content": prelim_text})
-                    fields_hint = "、".join(VERIFICATION_FIELDS)
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "很好，現在請根據上述初步判斷與稍早查詢到的所有事件資料，"
-                            "生成涵蓋所有事件的完整正式報告，並在報告最後附上一個 "
-                            "```json 區塊```，內容為一個 JSON 陣列，陣列中每個元素"
-                            f"對應一筆事件，格式為包含以下欄位的 JSON 物件：{fields_hint}。"
-                            "每個元素裡的每一個值都必須跟對應事件的工具查詢結果完全"
-                            "一致、逐字複製，不可張冠李戴、不可遺漏任何一筆事件。"
-                        ),
-                    })
-
                 for iteration in range(1, MAX_ITERATIONS + 1):
-                    if not all_tools_called and iteration == 1:
-                        is_valid, mismatches = False, [
-                            f"模型未查詢完所有事件，缺少：{missing_ids}"
-                        ]
+                    # ── 步驟A：確保這一輪的工具都查完，帶著tools參數重試最多
+                    #    len(incident_ids)+1次，讓模型有充分機會把所有事件查完 ──
+                    for _ in range(len(incident_ids) + 1):
+                        if len(tool_called_ids) >= len(incident_ids):
+                            break
+                        gather_response = await client.post(
+                            OLLAMA_URL_CHAT,
+                            json={
+                                "model": MODEL_NAME,
+                                "messages": messages,
+                                "tools": available_tools,
+                                "options": {"temperature": TEMPERATURE},
+                                "stream": False,
+                            },
+                            timeout=180.0,
+                        )
+                        gather_message = gather_response.json().get("message", {})
+                        if gather_message.get("tool_calls"):
+                            messages.append(gather_message)
+                            for tool_call in gather_message["tool_calls"]:
+                                if tool_call["function"]["name"] == "get_incident_by_id":
+                                    args = tool_call["function"].get("arguments", {})
+                                    try:
+                                        called_id_int = int(args.get("incident_id"))
+                                    except (TypeError, ValueError):
+                                        called_id_int = None
+                                    if called_id_int is not None and called_id_int not in tool_called_ids:
+                                        server_result = await session.call_tool(
+                                            "get_incident_by_id", arguments={"incident_id": called_id_int}
+                                        )
+                                        tool_called_ids.add(called_id_int)
+                                        messages.append({
+                                            "role": "tool",
+                                            "content": server_result.content[0].text,
+                                            "name": "get_incident_by_id",
+                                        })
+                        else:
+                            missing_now = [i for i in incident_ids if i not in tool_called_ids]
+                            if not missing_now:
+                                break
+                            messages.append({"role": "assistant", "content": gather_message.get("content", "")})
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"你還沒有查詢以下 incident_id 的資料，請繼續呼叫 "
+                                    f"`get_incident_by_id` 工具查詢：{', '.join(str(i) for i in missing_now)}"
+                                ),
+                            })
+
+                    all_tools_called = len(tool_called_ids) >= len(incident_ids)
+                    missing_ids = [i for i in incident_ids if i not in tool_called_ids]
+
+                    # ── 步驟B：工具都查完才寫報告；查不完就直接判失敗，
+                    #    不浪費一次生成報告的呼叫 ──
+                    if not all_tools_called:
+                        is_valid, mismatches = False, [f"模型未查詢完所有事件，缺少：{missing_ids}"]
                     else:
+                        # 【拉開推理距離，沿用v17】只在第一次做，之後重試直接
+                        # 根據既有對話紀錄要求重新產生報告，不用重複問前情提要。
+                        if not prelim_done:
+                            prelim_prompt = (
+                                "在正式生成報告前，請先用不超過150字，寫一段初步情境判斷"
+                                "（純文字敘述，不需要包含JSON），簡述你從工具查詢結果看到"
+                                "了這幾筆事件的重點。"
+                            )
+                            messages.append({"role": "user", "content": prelim_prompt})
+                            prelim_response = await client.post(
+                                OLLAMA_URL_CHAT,
+                                json={
+                                    "model": MODEL_NAME,
+                                    "messages": messages,
+                                    "options": {"temperature": TEMPERATURE},
+                                    "stream": False,
+                                },
+                                timeout=180.0,
+                            )
+                            prelim_text = prelim_response.json().get("message", {}).get("content", "")
+                            messages.append({"role": "assistant", "content": prelim_text})
+                            prelim_done = True
+
+                        fields_hint = "、".join(VERIFICATION_FIELDS)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "現在請根據稍早查詢到的所有事件資料，生成涵蓋所有事件的"
+                                "完整正式報告，並在報告最後附上一個 ```json 區塊```，內容"
+                                "為一個 JSON 陣列，陣列中每個元素對應一筆事件，格式為包含"
+                                f"以下欄位的 JSON 物件：{fields_hint}。每個元素裡的每一個值"
+                                "都必須跟對應事件的工具查詢結果完全一致、逐字複製，不可"
+                                "張冠李戴、不可遺漏任何一筆事件。"
+                            ),
+                        })
                         final_response = await client.post(
                             OLLAMA_URL_CHAT,
                             json={
@@ -461,6 +458,7 @@ async def run_proposed_once(gts: list) -> dict:
                         else:
                             is_valid, mismatches = _verify_multi(llm_json_array, gts)
 
+                    mismatches_history.append({"iteration": iteration, "is_valid": is_valid, "mismatches": mismatches})
                     iteration_valid_flags.append(is_valid)
                     if is_valid:
                         break
@@ -468,7 +466,10 @@ async def run_proposed_once(gts: list) -> dict:
                         messages.append({"role": "assistant", "content": full_text})
                         messages.append({
                             "role": "user",
-                            "content": f"你上一次的回答有以下問題：{mismatches}，請重新產生完整報告。",
+                            "content": (
+                                f"你上一次的回答有以下問題：{mismatches}，請重新產生完整報告"
+                                "（若問題是缺少某筆事件的資料，請先呼叫工具補查）。"
+                            ),
                         })
 
     elapsed = time.time() - start
@@ -481,6 +482,7 @@ async def run_proposed_once(gts: list) -> dict:
         "hallucination_count": score_hallucination(narrative_text, gts),
         "hallucination_keywords_hit": get_hallucination_groups_hit(narrative_text, gts),
         "iterations_used": len(iteration_valid_flags),
+        "mismatches_history": mismatches_history,
         "tools_called_count": len(tool_called_ids),
         "expected_tools_count": len(incident_ids),
         "output_text": narrative_text,
@@ -627,8 +629,13 @@ async def main():
 
     gts = [fetch_ground_truth_by_id(i) for i in incident_ids]
 
+    # 【v2新增】每次執行都用時間戳記產生獨一無二的檔名，不會再覆蓋掉
+    # 上一次跑的結果，之後要回頭比較「這次跟上次差在哪」不用再自己
+    # 手動搬檔案備份。
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     print(f"\n{'=' * 74}")
-    print(f"   消融實驗 multi — 多筆事件同時驗證，測試是否會張冠李戴、能否觸發迭代重試")
+    print(f"   消融實驗 multi_v2 — 多筆事件同時驗證，測試是否會張冠李戴、能否觸發迭代重試")
     print(f"   Ground Truth 事件：{[(g['incident_id'], g['event_type']) for g in gts]}")
     print(f"   模型: {MODEL_NAME}  |  temperature={TEMPERATURE}  |  每組 N={N_RUNS}，共 {N_RUNS * 3} 次")
     print(f"{'=' * 74}")
@@ -652,7 +659,10 @@ async def main():
 
     results_by_condition = {"baseline": [], "tool_only": [], "proposed": []}
     failed_runs = []
-    incremental_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_multi_partial.json"
+    incremental_path = (
+        r"D:\NCKU_paper_Capstone_Project\reports"
+        f"\\ablation_results_multi_v2_{run_timestamp}_partial.json"
+    )
 
     for i, condition in enumerate(conditions):
         print(f"▶ Run {i + 1:02d}/{len(conditions)} [{condition_labels[condition]}]", flush=True)
@@ -753,13 +763,16 @@ async def main():
         "raw_tool_only": results_by_condition["tool_only"],
         "raw_proposed": results_by_condition["proposed"],
     }
-    out_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_multi.json"
+    out_path = (
+        r"D:\NCKU_paper_Capstone_Project\reports"
+        f"\\ablation_results_multi_v2_{run_timestamp}.json"
+    )
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
         print(f"📂 詳細數據已存至 {out_path}\n")
     except Exception:
-        fallback_path = "ablation_results_multi.json"
+        fallback_path = f"ablation_results_multi_v2_{run_timestamp}.json"
         with open(fallback_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
         print(f"📂 詳細數據已存至 {fallback_path}（預設路徑不可寫入，已退回目前目錄）\n")
