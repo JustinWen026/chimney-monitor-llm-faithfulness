@@ -1,3 +1,26 @@
+"""
+report_generator_bertscore_calibrated.py
+------------------------------------------
+【對應五階段路徑圖：階段三 —— BERTScore換模型，讓校準真的生效】
+
+跟 report_generator_v7.py 的唯一差異：BERTScore 評分改用的模型。
+
+問題背景：v7（以及更早的v3-v6）用的是 hfl/chinese-roberta-wwm-ext，這顆
+模型不在 bert_score 套件的官方支援清單裡，沒有預先算好的 baseline
+校準檔案，導致 rescale_with_baseline=True 這個選項悄悄跳過、實際上沒有
+真的校準，只是原始分數換了個名字重新印一次。
+
+這一版改用 bert-base-chinese——這是 BERTScore 原始論文（Zhang et al.,
+2020）裡明確列出的標準中文模型，總共12層、論文建議取第8層，且官方已經
+預先算好對應的 baseline 校準檔案，這次校準會真的生效。
+
+【重要】換模型代表分數量尺整個換了，舊版所有用 hfl/chinese-roberta-wwm-ext
+算出來的分數（包含排錯排很久才修好的那組 F1=0.6554）都不能拿來跟這版的
+分數比較，只能在論文裡當作「舊工具鏈的驗證紀錄」引用。除了 BERTScore
+這部分，其餘工具驗證、迭代重試、佇列制報告生成邏輯，都跟 v7 完全相同，
+沒有改動。
+"""
+
 import asyncio
 import json
 import os
@@ -22,6 +45,7 @@ BERTSCORE_SAFE_LENGTH = 200
 MAX_ITERATIONS = 2
 VERIFICATION_FIELDS = ["incident_id", "camera_id", "event_type", "severity", "risk_level", "timestamp"]
 VERIFICATION_LOG_PATH = os.path.join(REPORT_DIR, "verification_log.jsonl")
+BERTSCORE_LOG_PATH = os.path.join(REPORT_DIR, "bertscore_log.jsonl")
 TOOL_NAME = "get_incident_by_id"
 
 REFERENCE_REPORTS = {
@@ -150,6 +174,15 @@ def _verify_fields(llm_json, ground_truth: dict):
 
 def _append_verification_log(record: dict):
     with open(VERIFICATION_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _append_bertscore_log(record: dict):
+    """【新增】把每一筆 BERTScore 評分結果存進 jsonl，避免只印在終端機、
+    跑大量樣本時事後無法回頭核對分數。格式跟 _append_verification_log
+    對齊，方便之後用同一支腳本一起讀取彙整。"""
+    record.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    with open(BERTSCORE_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -285,12 +318,15 @@ async def _generate_report_async(incident_id: int, event_type: str):
             safe_candidate = narrative_text[:BERTSCORE_SAFE_LENGTH]
             safe_reference = reference_text[:BERTSCORE_SAFE_LENGTH]
 
-            # 【v7 修正】上一版發現：套件在找不到 baseline 檔案時，不會丟出例外，
-            # 只會印一個 UserWarning，然後直接跳過校準、悄悄回傳跟原始分數
-            # 完全相同的數字。原本用 try/except 的判斷方式完全攔不到這種情況，
-            # 會誤導成「已校準」但其實數值根本沒變。這裡改用 warnings 模組主動
-            # 攔截這個警告文字，只要偵測到「Baseline not Found」，就明確標示
-            # 校準不可用，而不是誤植一組看似校準過、實際上原封不動的數字。
+            # 【本檔案核心修正】原本用的 hfl/chinese-roberta-wwm-ext 不在
+            # bert_score 官方支援清單裡，沒有預先算好的 baseline 校準檔案，
+            # rescale_with_baseline=True 只會悄悄跳過、不會真的生效。改用
+            # bert-base-chinese——這是官方論文裡列出的標準中文模型，總共
+            # 12層，論文建議取第8層（Zhang et al., 2020 Table 8），且官方
+            # 已經預先算好對應的 baseline 檔案，這次校準會真的生效。
+            # warnings 攔截邏輯繼續保留當防呆：如果套件版本更新導致這個
+            # 模型的 baseline 檔案又不見了，至少不會誤植一組看似校準過、
+            # 實際上數值沒變的分數。
             import warnings
             baseline_missing = False
             with warnings.catch_warnings(record=True) as caught_warnings:
@@ -299,8 +335,8 @@ async def _generate_report_async(incident_id: int, event_type: str):
                     [safe_candidate],
                     [safe_reference],
                     lang="zh",
-                    model_type="hfl/chinese-roberta-wwm-ext",
-                    num_layers=12,
+                    model_type="bert-base-chinese",
+                    num_layers=8,
                     device="cuda",
                     nthreads=1,
                     batch_size=1,
@@ -314,8 +350,8 @@ async def _generate_report_async(incident_id: int, event_type: str):
                 [safe_candidate],
                 [safe_reference],
                 lang="zh",
-                model_type="hfl/chinese-roberta-wwm-ext",
-                num_layers=12,
+                model_type="bert-base-chinese",
+                num_layers=8,
                 device="cuda",
                 nthreads=1,
                 batch_size=1,
@@ -326,8 +362,8 @@ async def _generate_report_async(incident_id: int, event_type: str):
             )
             if baseline_missing:
                 print(
-                    "ℹ️ [BERTScore 校準] hfl/chinese-roberta-wwm-ext 沒有對應的"
-                    " baseline 校準檔案，套件已自動跳過校準，"
+                    "ℹ️ [BERTScore 校準] bert-base-chinese 這次也沒有抓到"
+                    " baseline 校準檔案（不應該發生，若出現請回報），"
                     "以上僅為未校準的原始分數。"
                 )
             else:
@@ -337,18 +373,52 @@ async def _generate_report_async(incident_id: int, event_type: str):
                 )
                 print(
                     "   （校準後分數扣掉了 BERT 詞向量空間的系統性偏差，"
-                    "更能反映報告與參考答案之間真正的語意差異程度）"
+                    "更能反映報告與參考答案之間真正的語意差異程度。"
+                    "注意：換了模型，這組分數跟舊版用 hfl/chinese-roberta-wwm-ext"
+                    "算出來的分數不能直接比較，是全新的量尺，需重新累積資料。）"
                 )
             print(
                 f"   （註：評分僅取報告前 {BERTSCORE_SAFE_LENGTH} 字元，"
                 "且已排除結尾的驗證用JSON區塊，只評分敘述正文）"
             )
+
+            # 【新增】把這一筆的分數存進 bertscore_log.jsonl，而不是只印在
+            # 終端機。raw_* 一定有值；calibrated_* 在 baseline_missing 時
+            # 設為 None，代表這筆沒有真的套用校準，事後彙整統計時要能
+            # 排除或另外標記，不要誤當成校準後分數平均進去。
+            _append_bertscore_log({
+                "incident_id": incident_id,
+                "event_type": event_type,
+                "status": "scored",
+                "baseline_missing": baseline_missing,
+                "candidate_length": len(safe_candidate),
+                "reference_length": len(safe_reference),
+                "raw_precision": P.item(),
+                "raw_recall": R.item(),
+                "raw_f1": F1.item(),
+                "calibrated_precision": None if baseline_missing else rP.item(),
+                "calibrated_recall": None if baseline_missing else rR.item(),
+                "calibrated_f1": None if baseline_missing else rF1.item(),
+            })
         except Exception as e:
             import traceback
             print(f"⚠️ [BERTScore 評分失敗]: {e}")
             traceback.print_exc()
+            # 【新增】評分失敗也要留紀錄，否則事後統計「實際成功筆數」時
+            # 會漏掉這筆，跟ablation study的n_runs_each_actual邏輯對齊。
+            _append_bertscore_log({
+                "incident_id": incident_id,
+                "event_type": event_type,
+                "status": "scoring_failed",
+                "error": str(e),
+            })
     else:
         print(f"⚠️ 事件類型「{event_type}」尚無對應的參考報告，略過 BERTScore 評分。")
+        _append_bertscore_log({
+            "incident_id": incident_id,
+            "event_type": event_type,
+            "status": "skipped_no_reference_or_empty_narrative",
+        })
 
 
 def trigger_report_generation_async(incident_id: int, event_type: str):
