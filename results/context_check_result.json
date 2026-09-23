@@ -1,0 +1,73 @@
+{
+  "ollama_version": "0.34.2",
+  "model_max_context": 32768,
+  "modelfile_parameters": "",
+  "results": [
+    {
+      "case": "單事故 Baseline",
+      "default_prompt_tokens": 360,
+      "full_prompt_tokens": 362,
+      "verdict": "OK"
+    },
+    {
+      "case": "單事故 Tool-only 第一次呼叫(含tools)",
+      "default_prompt_tokens": 806,
+      "full_prompt_tokens": 807,
+      "verdict": "OK"
+    },
+    {
+      "case": "單事故 Tool-only 寫報告",
+      "default_prompt_tokens": 554,
+      "full_prompt_tokens": 557,
+      "verdict": "OK"
+    },
+    {
+      "case": "單事故 Proposed 寫報告",
+      "default_prompt_tokens": 681,
+      "full_prompt_tokens": 677,
+      "verdict": "OK"
+    },
+    {
+      "case": "單事故 Proposed 重試(最長情況)",
+      "default_prompt_tokens": 1517,
+      "full_prompt_tokens": 1517,
+      "verdict": "OK"
+    },
+    {
+      "case": "多事故 v2 Baseline",
+      "default_prompt_tokens": 663,
+      "full_prompt_tokens": 666,
+      "verdict": "OK"
+    },
+    {
+      "case": "多事故 v2 Tool-only 寫報告",
+      "default_prompt_tokens": 531,
+      "full_prompt_tokens": 531,
+      "verdict": "OK"
+    },
+    {
+      "case": "多事故 v2 Proposed 寫報告",
+      "default_prompt_tokens": 919,
+      "full_prompt_tokens": 921,
+      "verdict": "OK"
+    },
+    {
+      "case": "多事故 v2 Proposed 重試(最長情況)",
+      "default_prompt_tokens": 1789,
+      "full_prompt_tokens": 1784,
+      "verdict": "OK"
+    },
+    {
+      "case": "多事故 v3 Tool-only 寫報告",
+      "default_prompt_tokens": 1103,
+      "full_prompt_tokens": 1105,
+      "verdict": "OK"
+    },
+    {
+      "case": "多事故 v3 Proposed 重試(最長情況)",
+      "default_prompt_tokens": 2513,
+      "full_prompt_tokens": 2513,
+      "verdict": "OK"
+    }
+  ]
+}
