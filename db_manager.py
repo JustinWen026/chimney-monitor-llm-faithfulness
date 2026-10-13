@@ -2,7 +2,7 @@ from datetime import datetime
 import os
 import sqlite3
 
-DB_PATH = r"D:\NCKU_paper_Capstone_Project\safety_incidents.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "safety_incidents.db")
 
 
 def init_db():

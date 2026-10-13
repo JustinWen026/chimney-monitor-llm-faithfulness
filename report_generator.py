@@ -35,7 +35,7 @@ from mcp.client.stdio import stdio_client
 
 OLLAMA_URL_CHAT = "http://localhost:11434/api/chat"
 MODEL_NAME = "qwen2.5:7b-instruct"
-REPORT_DIR = r"D:\NCKU_paper_Capstone_Project\reports"
+REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 os.makedirs(REPORT_DIR, exist_ok=True)
 
 # 【v5 修正】改指向新版 MCP Server，內含依 incident_id 精確查詢的工具。

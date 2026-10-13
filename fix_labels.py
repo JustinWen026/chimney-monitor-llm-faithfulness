@@ -2,7 +2,7 @@ import glob
 import os
 
 # 你的第二份資料集（無火焰）絕對路徑
-dataset_nofire_path = r"D:\NCKU_paper_Capstone_Project\chimney.v2-2026-08-14chimnetblack_smokywhite_smoky.yolov11"
+dataset_nofire_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets", "chimney_smoke")
 
 
 def convert_label_id(split_name):

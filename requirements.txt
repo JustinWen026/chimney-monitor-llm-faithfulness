@@ -1,0 +1,23 @@
+# 偵測與影像
+ultralytics>=8.3
+opencv-python
+numpy
+pillow
+moviepy            # 只有 video_cut.py 會用到
+
+# LLM 報告生成（需另外安裝 Ollama 並 pull qwen2.5:7b-instruct）
+mcp
+httpx
+requests
+
+# 評估
+bert-score
+transformers
+torch              # BERTScore 預設在 CUDA 上執行
+scipy
+
+# 儀表板與分析
+streamlit
+streamlit-autorefresh
+pandas
+matplotlib

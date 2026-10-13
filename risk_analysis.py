@@ -28,10 +28,11 @@ import cv2
 import numpy as np
 import pandas as pd
 
-DB_PATH = r"D:\NCKU_paper_Capstone_Project\safety_incidents.db"
-OUTPUT_CSV = r"D:\NCKU_paper_Capstone_Project\reports\misjudgment_analysis.csv"
-OUTPUT_SUMMARY = r"D:\NCKU_paper_Capstone_Project\reports\misjudgment_summary.txt"
-OUTPUT_CORRELATION_CSV = r"D:\NCKU_paper_Capstone_Project\reports\correlation_analysis.csv"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(PROJECT_ROOT, "safety_incidents.db")
+OUTPUT_CSV = os.path.join(PROJECT_ROOT, "reports", "misjudgment_analysis.csv")
+OUTPUT_SUMMARY = os.path.join(PROJECT_ROOT, "reports", "misjudgment_summary.txt")
+OUTPUT_CORRELATION_CSV = os.path.join(PROJECT_ROOT, "reports", "correlation_analysis.csv")
 GLARE_BRIGHTNESS_THRESHOLD = 240
 
 SEVERITY_ORDER = ["WARNING", "HIGH", "CRITICAL"]

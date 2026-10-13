@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 編輯器 / 系統
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 資料集影像（請自行從 Roboflow 下載，見 README）
+datasets/*/train/
+datasets/*/valid/
+datasets/*/test/
+datasets/merged/images/
+datasets/merged/labels/
+*.cache
+*.zip
+
+# YOLO 訓練輸出與預訓練權重（執行時自動下載）
+runs/
+yolo11*.pt
+yolo26*.pt
+
+# 執行時產生的檔案
+snapshots/
+reports/*_partial.json
+mcp_error_log.txt
+
+# 機密
+.env

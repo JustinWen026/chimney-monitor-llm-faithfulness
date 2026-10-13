@@ -1,5 +1,4 @@
-# 資料集根目錄絕對路徑
-path: D:/NCKU_paper_Capstone_Project/dataset_merged
+# 不設定 path：Ultralytics 會以這個 yaml 所在資料夾（datasets/merged）為根目錄
 train: images/train
 val: images/val
 

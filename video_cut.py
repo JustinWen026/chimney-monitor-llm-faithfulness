@@ -52,8 +52,8 @@ def process_video(
 
 
 if __name__ == "__main__":
-  input_video = r"C:\Users\User\Downloads\PixVerse_Cropped.mp4"
-  output_video = r"C:\Users\User\Downloads\PixVerse_Clean_Slow.mp4"
+  input_video = os.path.join("assets", "PixVerse_Cropped.mp4")
+  output_video = os.path.join("assets", "PixVerse_Clean_Slow.mp4")
 
   # 裁切底部 10% 且放慢為 0.5 倍速 (可自由調整 0.5 ~ 0.8)
   process_video(

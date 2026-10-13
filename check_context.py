@@ -23,12 +23,12 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 import ablation_single as v14
-import ablation_concurrent as mv2
+import ablation_concurrent as mv3
 
-try:
-    import ablation_concurrent as mv3
-except Exception:
-    mv3 = None
+# 「多事故 v2」的檢查對象是並發實驗 v2 的 prompt 函式，最終版 ablation_concurrent.py（v3）
+# 已改名，這部分結果保存在 results/context_check_result.json；要重跑請 checkout
+# 「並發實驗 v2」那個 commit。
+mv2 = mv3 if hasattr(mv3, "_build_proposed_prompt_multi") else None
 
 OLLAMA = "http://localhost:11434"
 MODEL = "qwen2.5:7b-instruct"
@@ -74,26 +74,27 @@ async def build_cases(session, tools):
           {"role": "user", "content": "你上一次的回答有欄位不符：['event_type']，請重新產生完整報告。"}], None),
     ]
 
-    gts = [mv2.fetch_ground_truth_by_id(i) for i in MULTI_IDS]
+    gts = [mv3.fetch_ground_truth_by_id(i) for i in MULTI_IDS]
     multi_tools = [await tool_result(i) for i in MULTI_IDS]
-    v2_report_req = ("現在請根據稍早查詢到的所有事件資料，生成涵蓋所有事件的完整正式報告，"
-                     "並在報告最後附上一個 ```json 區塊```。")
-    v2_prop = [{"role": "user", "content": mv2._build_proposed_prompt_multi(MULTI_IDS)},
-               tool_call_msg(MULTI_IDS), *multi_tools,
-               {"role": "user", "content": "在正式生成報告前，請先用不超過150字，寫一段初步情境判斷。"},
-               {"role": "assistant", "content": PRELIM_TEXT},
-               {"role": "user", "content": v2_report_req}]
-    cases += [
-        ("多事故 v2 Baseline", [{"role": "user", "content": mv2.build_baseline_prompt(gts)}], None),
-        ("多事故 v2 Tool-only 寫報告",
-         [{"role": "user", "content": mv2._build_tool_only_prompt_multi(MULTI_IDS)},
-          tool_call_msg(MULTI_IDS), *multi_tools], None),
-        ("多事故 v2 Proposed 寫報告", v2_prop, None),
-        ("多事故 v2 Proposed 重試(最長情況)",
-         v2_prop + [{"role": "assistant", "content": REPORT_TEXT},
-                    {"role": "user", "content": "你上一次的回答有以下問題：[...]，請重新產生完整報告。"},
-                    {"role": "user", "content": v2_report_req}], None),
-    ]
+    if mv2 is not None:
+        v2_report_req = ("現在請根據稍早查詢到的所有事件資料，生成涵蓋所有事件的完整正式報告，"
+                         "並在報告最後附上一個 ```json 區塊```。")
+        v2_prop = [{"role": "user", "content": mv2._build_proposed_prompt_multi(MULTI_IDS)},
+                   tool_call_msg(MULTI_IDS), *multi_tools,
+                   {"role": "user", "content": "在正式生成報告前，請先用不超過150字，寫一段初步情境判斷。"},
+                   {"role": "assistant", "content": PRELIM_TEXT},
+                   {"role": "user", "content": v2_report_req}]
+        cases += [
+            ("多事故 v2 Baseline", [{"role": "user", "content": mv2.build_baseline_prompt(gts)}], None),
+            ("多事故 v2 Tool-only 寫報告",
+             [{"role": "user", "content": mv2._build_tool_only_prompt_multi(MULTI_IDS)},
+              tool_call_msg(MULTI_IDS), *multi_tools], None),
+            ("多事故 v2 Proposed 寫報告", v2_prop, None),
+            ("多事故 v2 Proposed 重試(最長情況)",
+             v2_prop + [{"role": "assistant", "content": REPORT_TEXT},
+                        {"role": "user", "content": "你上一次的回答有以下問題：[...]，請重新產生完整報告。"},
+                        {"role": "user", "content": v2_report_req}], None),
+        ]
 
     if mv3 is not None:
         v3_prop = [{"role": "user", "content": mv3.build_proposed_prompt(gts)},

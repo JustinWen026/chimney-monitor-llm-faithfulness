@@ -4,6 +4,8 @@ os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0"  # RTX 5060 Blackwell 架構
 import torch
 from ultralytics import YOLO
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 if __name__ == "__main__":
     # 訓練前確認 GPU 環境（你已經確認過沒問題，這裡保留是為了每次訓練都留一份紀錄在 log 裡）
     print(f"PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}")
@@ -13,7 +15,7 @@ if __name__ == "__main__":
     model = YOLO("yolo11s.pt")
 
     results = model.train(
-        data="D:/NCKU_paper_Capstone_Project/dataset_merged/data.yaml",
+        data=os.path.join(PROJECT_ROOT, "datasets", "merged", "data.yaml"),
         epochs=500,
         patience=30,
         imgsz=640,
@@ -21,7 +23,7 @@ if __name__ == "__main__":
         device=0,
         workers=4,
         seed=42,
-        project="D:/NCKU_paper_Capstone_Project/runs/detect",
+        project=os.path.join(PROJECT_ROOT, "runs", "detect"),
         name="chimney_smoke_fire_yolo11s",
         save=True,
         plots=True,

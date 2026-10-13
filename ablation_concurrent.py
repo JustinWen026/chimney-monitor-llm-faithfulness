@@ -35,6 +35,7 @@ ablation_study_multi_v3.py
 
 import asyncio
 import json
+import os
 import random
 import re
 import sqlite3
@@ -603,8 +604,8 @@ async def main():
     funcs = {"baseline": run_baseline_once, "tool_only": run_tool_only_once, "proposed": run_proposed_once}
     results = {k: [] for k in funcs}
     failed = []
-    base_dir = r"D:\NCKU_paper_Capstone_Project\reports"
-    partial = f"{base_dir}\\ablation_results_multi_v3_{stamp}_partial.json"
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
+    partial = os.path.join(base_dir, f"ablation_results_multi_v3_{stamp}_partial.json")
 
     for i, cond in enumerate(conditions):
         print(f"▶ Run {i + 1:03d}/{len(conditions)} [{cond}]", flush=True)
@@ -656,7 +657,7 @@ async def main():
         "raw_tool_only": results["tool_only"],
         "raw_proposed": results["proposed"],
     }
-    path = save_json(output, f"{base_dir}\\ablation_results_multi_v3_{stamp}.json",
+    path = save_json(output, os.path.join(base_dir, f"ablation_results_multi_v3_{stamp}.json"),
                      f"ablation_results_multi_v3_{stamp}.json")
     print(f"\n📂 結果已存至 {path}\n")
 

@@ -22,6 +22,7 @@ ablation_study_v10.py
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import statistics
@@ -587,7 +588,7 @@ async def main():
         "raw_tool_only": results_by_condition["tool_only"],
         "raw_proposed": results_by_condition["proposed"],
     }
-    out_path = r"D:\NCKU_paper_Capstone_Project\reports\ablation_results_v12.json"
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports", "ablation_results_v12.json")
     try:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)

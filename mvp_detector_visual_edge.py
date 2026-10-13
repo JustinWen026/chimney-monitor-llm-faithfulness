@@ -12,16 +12,14 @@ from ultralytics import YOLO
 # ==============================================================================
 # 1. 系統參數配置
 # ==============================================================================
-PROJECT_ROOT = r"D:\NCKU_paper_Capstone_Project"
-MODEL_PATH = os.path.join(
-    PROJECT_ROOT, r"runs\detect\chimney_smoke_fire_yolo11s\weights\best.pt"
-)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(PROJECT_ROOT, "weights", "best.pt")
 SNAPSHOT_DIR = os.path.join(PROJECT_ROOT, "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 CAMERA_SOURCES = {
-    "CAM-01": os.path.join(PROJECT_ROOT, "PixVerse_Clean_Slow.mp4"),
-    "CAM-02": os.path.join(PROJECT_ROOT, "clean_video_perfect.mp4"),
+    "CAM-01": os.path.join(PROJECT_ROOT, "assets", "PixVerse_Clean_Slow.mp4"),
+    "CAM-02": os.path.join(PROJECT_ROOT, "assets", "clean_video_perfect.mp4"),
 }
 
 ALERT_THRESHOLD_SEC = 3.0
